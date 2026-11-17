@@ -49,11 +49,7 @@ dependencies {
     implementation 'androidx.media3:media3-ui:1.11.0'
     implementation 'androidx.media3:media3-exoplayer-hls:1.11.0'
     implementation 'androidx.media3:media3-inspector-frame:1.11.0'
-    implementation files('libs/cronet-api-143.7445.0.aar')
-    implementation files('libs/cronet-shared-143.7445.0.aar')
-    implementation files('libs/cronet-common-143.7445.0.aar')
-    implementation files('libs/httpengine-native-provider-143.7445.0.aar')
-    implementation files('libs/cronet-embedded-143.7445.0.aar')
+    implementation 'org.chromium.net:cronet-embedded:143.7445.0'
     implementation 'org.jsoup:jsoup:1.18.3'
     implementation 'com.squareup.okhttp3:okhttp:5.3.0'
     testImplementation 'junit:junit:4.13.2'

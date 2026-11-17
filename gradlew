@@ -1,10 +1,5 @@
 #!/bin/sh
 
-# The wrapper JAR is an explicitly prepared, hash-verified local input.
-KHUB_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
-python3 "$KHUB_ROOT/scripts/prepare-untracked-resources.py" --check || exit 1
-
-#
 # Copyright © 2015-2021 the original authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

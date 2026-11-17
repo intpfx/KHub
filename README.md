@@ -115,18 +115,25 @@ APK 哈希。
 
 ## 开发
 
-需要 JDK 17 或更新版本、Android SDK 36、Python 3、Node.js，以及
-FFmpeg / ffprobe（媒体片段测试）。通过 `local.properties` 配置本机 Android SDK
-路径。使用仓库自带 Gradle Wrapper：
+构建需要 JDK 17 或 21、Android SDK Platform 36、Build Tools 35.0.0
+和网络连接。用 Android Studio 的 SDK Manager 安装 SDK 并接受许可，设置
+`ANDROID_HOME` 或在本地 `local.properties` 配置 `sdk.dir`，然后执行：
 
 ```sh
-./gradlew :app:assembleDebug :app:lintDebug :app:testDebugUnitTest
-./tests/run.sh
+git clone https://github.com/intpfx/KHub.git
+cd KHub
+./gradlew :app:assembleDebug
 ```
 
-Debug APK 输出为
-`app/build/outputs/apk/debug/app-debug.apk`，它不是正式发布包。Debug 版本启用
-WebView 调试。家庭候选签名及 APK 核验见 [家庭自用发布](docs/FAMILY-RELEASE.md)。
+Windows 用 `gradlew.bat :app:assembleDebug`。仓库自带 Gradle 8.13 Wrapper，
+首次运行会校验并下载 Gradle，再从公开 Maven 仓库解析依赖。Cronet 使用 Google Maven
+的 `org.chromium.net:cronet-embedded:143.7445.0`，并由 Gradle 拉取它声明的依赖。
+
+Debug APK 输出为 `app/build/outputs/apk/debug/app-debug.apk`。
+Android 单元测试和 lint 可用 `./gradlew :app:testDebugUnitTest :app:lintDebug`。
+另外可用 `sh tests/run.sh` 运行 Java 和 JavaScript 行为测试，其中 JavaScript
+媒体片段测试需要 Node.js、FFmpeg 和 ffprobe。家庭候选签名及 APK 核验见
+[家庭自用发布](docs/FAMILY-RELEASE.md)。
 
 ## 连接与使用
 
@@ -150,7 +157,7 @@ cached 状态并被系统冻结；该结论现在只影响直播恢复，不再�
 ## 仓库与分发
 
 - `app/`：Android 应用、随包页面资源及原生测试。
-- `tests/`：Java、JavaScript 行为测试及 Python 构建辅助脚本。
+- `tests/`：Java 和 JavaScript 行为测试。
 - `scripts/`：构建辅助与发布校验。
 - `docs/`：维护和发布文档。旧版的实机验证和迁移记录也收录在此。
 
@@ -163,16 +170,6 @@ KHub 自有源码采用 [MIT 许可证](LICENSE)。第三方代码、素材和�
 
 音乐实现的复用来源见 [NOTICE](app/src/main/assets/music/NOTICE)。1.0
 发布前还需完成全部依赖与素材的许可核查、对应源码交付安排及通知清单。
-
-## 本地构建输入
-
-在仓库根目录执行 `./gradlew :app:assembleDebug`。Gradle Wrapper 与 Cronet AAR 使用
-[SHA-256 清单](scripts/untracked-resources.json)校验。已有本地资源可运行
-`python3 scripts/prepare-untracked-resources.py --check`；若缺失，使用
-`python3 scripts/prepare-untracked-resources.py --source-dir /path/to/local/resources`，
-源目录按仓库相对路径组织。已有 Gradle 8.13 安装也可用于
-`python3 scripts/prepare-gradle-wrapper-inputs.py --gradle-home /path/to/gradle-8.13`
-提取 Wrapper。Cronet 本地二进制的公开分发权利与对应通知尚待核对。
 
 ## 从旧版迁移
 

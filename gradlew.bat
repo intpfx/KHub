@@ -1,5 +1,3 @@
-@python "%~dp0scripts\prepare-untracked-resources.py" --check
-@if errorlevel 1 exit /b 1
 @rem
 @rem Copyright 2015 the original author or authors.
 @rem

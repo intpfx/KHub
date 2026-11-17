@@ -31,7 +31,6 @@ __pycache__/
 .env
 .env.*
 
-# Hash-pinned local resources and legacy launcher artwork.
-/gradle/wrapper/gradle-wrapper.jar
+# Legacy local libraries and launcher artwork.
 /app/libs/*.aar
 /app/src/main/res/drawable-nodpi/banner.png
