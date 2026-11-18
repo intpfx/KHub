@@ -122,28 +122,105 @@ class VodCacheManagerTest {
             }
         } finally { background { resumed.close() }; dir.deleteRecursively() }
     }
-    @Test fun hlsCachesManifestAndSegmentsAndRejectsLivePlaylist() {
-        val context: Context = ApplicationProvider.getApplicationContext(); val dir = directory()
-        val manifest = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nsegment.ts\n#EXT-X-ENDLIST\n".toByteArray()
+    @Test fun hlsRetryReusesCompletedSegmentAndLivePlaylistFailsImmediately() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val dir = directory()
+        val manifest = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nfirst.ts\n#EXTINF:4,\nsecond.ts\n#EXT-X-ENDLIST\n"
+        val firstOpens = AtomicLong()
+        val secondOpens = AtomicLong()
         val manager = VodCacheManager(context, dir, 100_000, 0, { _, _ -> spec("application/x-mpegURL") }, {
-            androidx.media3.datasource.DataSource.Factory { object : androidx.media3.datasource.DataSource {
-                var delegate: ByteArrayDataSource? = null
-                override fun addTransferListener(listener: androidx.media3.datasource.TransferListener) {}
-                override fun open(data: DataSpec): Long { delegate = ByteArrayDataSource(if (data.uri.toString().endsWith("segment.ts")) byteArrayOf(1,2,3) else manifest); return delegate!!.open(data) }
-                override fun read(buffer: ByteArray, offset: Int, length: Int) = delegate!!.read(buffer, offset, length)
-                override fun getUri() = delegate?.uri
-                override fun close() { delegate?.close() }
-            } }
+            androidx.media3.datasource.DataSource.Factory {
+                object : androidx.media3.datasource.DataSource {
+                    private var delegate: ByteArrayDataSource? = null
+                    override fun addTransferListener(listener: androidx.media3.datasource.TransferListener) {}
+                    override fun open(data: DataSpec): Long {
+                        val bytes = when (data.uri.lastPathSegment) {
+                            "first.ts" -> {
+                                firstOpens.incrementAndGet()
+                                byteArrayOf(1, 2, 3)
+                            }
+                            "second.ts" -> {
+                                if (secondOpens.incrementAndGet() == 1L) throw java.net.SocketException("Connection reset")
+                                byteArrayOf(4, 5, 6)
+                            }
+                            else -> manifest.toByteArray()
+                        }
+                        return ByteArrayDataSource(bytes).also { delegate = it }.open(data)
+                    }
+                    override fun read(buffer: ByteArray, offset: Int, length: Int) = delegate!!.read(buffer, offset, length)
+                    override fun getUri() = delegate?.uri
+                    override fun close() { delegate?.close() }
+                }
+            }
         })
-        try { background { manager.enqueue(ref()) }; await(manager, "complete"); assertTrue(background { manager.hasCompleted(ref()) }) }
-        finally { background { manager.close() }; dir.deleteRecursively() }
+        try {
+            background { manager.enqueue(ref()) }
+            await(manager, "complete")
+            assertTrue(background { manager.hasCompleted(ref()) })
+            assertEquals(1L, firstOpens.get())
+            assertEquals(2L, secondOpens.get())
+        } finally {
+            background { manager.close() }
+            dir.deleteRecursively()
+        }
         val liveDir = directory()
+        val liveReads = AtomicLong()
         val live = VodCacheManager(context, liveDir, 100_000, 0, { _, _ -> spec("application/x-mpegURL") }, {
-            androidx.media3.datasource.DataSource.Factory { ByteArrayDataSource(String(manifest).replace("#EXT-X-ENDLIST\n", "").toByteArray()) }
+            androidx.media3.datasource.DataSource.Factory {
+                liveReads.incrementAndGet()
+                ByteArrayDataSource(manifest.replace("#EXT-X-ENDLIST\n", "").toByteArray())
+            }
         })
-        try { background { live.enqueue(ref()) }; assertTrue(await(live, "failed").getString("error").contains("直播")); assertFalse(background { live.hasCompleted(ref()) }) }
-        finally { background { live.close() }; liveDir.deleteRecursively() }
+        try {
+            background { live.enqueue(ref()) }
+            val failure = await(live, "failed")
+            assertEquals("CACHE_UNSUPPORTED", failure.getString("errorCode"))
+            assertTrue(failure.getString("error").contains("直播"))
+            assertEquals(1L, liveReads.get())
+            assertFalse(background { live.hasCompleted(ref()) })
+        } finally {
+            background { live.close() }
+            liveDir.deleteRecursively()
+        }
     }
+    @Test fun clearEpisodesCancelsActiveAndQueuedJobsAndPreservesPlaybackHistory() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val dir = directory()
+        val entered = CountDownLatch(1)
+        val progress = context.getSharedPreferences("media-progress", Context.MODE_PRIVATE)
+        progress.edit().putLong("native-id", 42_000).apply()
+        val work = LibraryWork("fixture", "movie", 1, 1, "Local fixture")
+        val history = RecentVodHistory(context)
+        history.record(work, ref(), "第01集")
+        val activeRef = ref().put("episodeKey", "active")
+        val queuedRef = ref().put("episodeKey", "queued")
+        val manager = VodCacheManager(context, dir, 100_000, 0, { reference, request ->
+            if (reference.getString("episodeKey") == "active") {
+                entered.countDown()
+                while (!request.isCancelled()) Thread.sleep(5)
+                request.check()
+            }
+            assertEquals("episode", reference.getString("episodeKey"))
+            spec()
+        }, { androidx.media3.datasource.DataSource.Factory { ByteArrayDataSource(ByteArray(256)) } })
+        try {
+            background { manager.enqueue(ref()) }
+            await(manager, "complete")
+            background { manager.enqueue(activeRef); manager.enqueue(queuedRef) }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+            assertEquals(0, background { manager.clearEpisodes() })
+            val status = background { manager.status() }
+            assertEquals(0, status.getJSONArray("caches").length())
+            assertEquals(0L, status.getLong("usedBytes"))
+            assertEquals(42_000L, progress.getLong("native-id", 0))
+            assertEquals("episode", history.entries().single().getString("episodeKey"))
+        } finally {
+            background { manager.close() }
+            dir.deleteRecursively()
+        }
+    }
+
     @Test fun cancellingResolverRemovesPartialStateAndPreventsLateCompletion() {
         val context: Context = ApplicationProvider.getApplicationContext(); val dir = directory(); val entered = CountDownLatch(1)
         val manager = VodCacheManager(context, dir, 100_000, 0, { _, request -> entered.countDown(); while (!request.isCancelled()) Thread.sleep(5); request.check(); spec() }, { error("Cancelled resolver must not start network") })
@@ -191,6 +268,50 @@ class VodCacheManagerTest {
             background{val end=System.nanoTime()+TimeUnit.SECONDS.toNanos(3);while(resumed.status().getJSONArray("caches").length()>0&&System.nanoTime()<end)Thread.sleep(10);assertEquals(0,resumed.status().getLong("usedBytes"))}
         }finally{background{resumed.close()};dir.deleteRecursively()}
     }
+    @Test fun networkRetriesResumePartialBytesAndStopAfterThreeRetries() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        for (persistentFailure in listOf(false, true)) {
+            val dir = directory()
+            val body = ByteArray(16_384)
+            val positions = mutableListOf<Long>()
+            val source = androidx.media3.datasource.DataSource.Factory {
+                object : androidx.media3.datasource.DataSource {
+                    private val data = ByteArrayDataSource(body)
+                    private var fail = false
+                    private var reads = 0
+
+                    override fun addTransferListener(listener: androidx.media3.datasource.TransferListener) {}
+                    override fun open(spec: DataSpec): Long {
+                        positions.add(spec.position)
+                        fail = persistentFailure || positions.size == 1
+                        return data.open(spec)
+                    }
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                        if (fail && reads++ > 0) throw java.net.SocketTimeoutException()
+                        return data.read(buffer, offset, minOf(1024, length))
+                    }
+                    override fun getUri() = data.uri
+                    override fun close() = data.close()
+                }
+            }
+            val manager = VodCacheManager(context, dir, 100_000, 0, { _, _ -> spec() }, { source })
+            try {
+                background { manager.enqueue(ref()) }
+                val row = await(manager, if (persistentFailure) "failed" else "complete")
+                assertEquals(if (persistentFailure) 4 else 2, positions.size)
+                assertEquals(0L, positions.first())
+                assertTrue(positions.drop(1).all { it > 0 })
+                if (persistentFailure) {
+                    assertEquals("CACHE_TIMEOUT", row.getString("errorCode"))
+                    assertTrue(background { manager.status().getLong("usedBytes") } > 0)
+                }
+            } finally {
+                background { manager.close() }
+                dir.deleteRecursively()
+            }
+        }
+    }
+
     @Test fun missingCompletedFilesInvalidateOfflineCacheAndNormalPlaybackNeverCreatesCache() {
         val context:Context=ApplicationProvider.getApplicationContext();val dir=directory()
         val manager=VodCacheManager(context,dir,100_000,0,{_,_->spec()},{androidx.media3.datasource.DataSource.Factory{ByteArrayDataSource(ByteArray(256))}})
@@ -349,10 +470,14 @@ class VodCacheManagerTest {
     }
     @Test fun preflightTotalDeadlineClosesSlowManifestWithoutUserCancellation() {
         val context:Context=ApplicationProvider.getApplicationContext();val dir=directory();val blocked=BlockingManifest()
-        val manager=VodCacheManager(context,dir,100_000,0,{_,_->spec("application/x-mpegURL")},{androidx.media3.datasource.DataSource.Factory{blocked}},manifestTimeoutMillis=150)
+        val opens = AtomicLong()
+        val manager=VodCacheManager(context,dir,100_000,0,{_,_->spec("application/x-mpegURL")},{androidx.media3.datasource.DataSource.Factory{
+            if (opens.getAndIncrement() == 0L) blocked else BlockingManifest()
+        }},manifestTimeoutMillis=150)
         try{
             background{manager.enqueue(ref())};assertTrue(blocked.reading.await(2,TimeUnit.SECONDS))
             val failed=await(manager,"failed");assertTrue(failed.getString("error").contains("超时"))
+            assertEquals(4L, opens.get())
             assertEquals(0,blocked.closed.count);assertFalse(background{manager.hasCompleted(ref())});assertEquals(0,background{manager.status().getLong("usedBytes")})
         }finally{blocked.close();background{manager.close()};dir.deleteRecursively()}
     }

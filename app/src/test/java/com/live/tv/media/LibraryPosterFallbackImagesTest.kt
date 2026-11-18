@@ -47,6 +47,24 @@ class LibraryPosterFallbackImagesTest {
     private fun view() = ImageView(ApplicationProvider.getApplicationContext())
     private fun bitmap(view: ImageView) = (view.drawable as? BitmapDrawable)?.bitmap
 
+    @Test fun xiguaOriginCannotOccupyBothPosterWorkers() {
+        val f = Fixture()
+        val images = f.scope()
+        val first = view()
+        val second = view()
+        val backup = view()
+        images.load(first, "https://vod.xiguazyimg.com/broken-1.jpg")
+        images.load(second, "https://vod.xiguazyimg.com/broken-2.jpg")
+        assertEquals(1, f.worker.size)
+        images.load(backup, "https://backup.example/poster.jpg")
+        assertEquals(2, f.worker.size)
+        f.worker.drain()
+        f.deliver()
+        assertEquals(listOf("https://vod.xiguazyimg.com/broken-1.jpg", "https://backup.example/poster.jpg",
+            "https://vod.xiguazyimg.com/broken-2.jpg"), f.fetches)
+        assertNotNull(backup.drawable)
+    }
+
     @Test fun failedPrimaryUsesSharedFallbackAndSuccessfulArtSurvivesFailureTtl() {
         val f = Fixture(); val images = f.scope(); val first = view(); val selected = work()
         images.load(first, selected); f.worker.drain(); f.deliver()

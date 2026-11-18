@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Looper
 import android.util.AtomicFile
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.C
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSink
@@ -137,7 +138,7 @@ class VodCacheManager internal constructor(
     @Synchronized fun enqueue(ref: JSONObject): JSONObject {
         load(); val copied = JSONObject(ref.toString()); val id = identity(copied)
         val old = jobs[id]
-        if (old != null && (old.state in listOf("queued", "resolving", "downloading", "removing") || complete(old)))
+        if (old != null && (old.state in listOf("queued", "resolving", "downloading", "removing") || old.thread != null || complete(old)))
             return JSONObject().put("ok", true).put("cache", old.publicJson())
         if (old == null && jobs.size >= 16) throw VodException("CACHE_LIMIT", "缓存列表已满，请先移除不需要的剧集")
         val job = old ?: Job(id, copied)
@@ -145,9 +146,25 @@ class VodCacheManager internal constructor(
         worker.execute { download(job) }
         return JSONObject().put("ok", true).put("cache", job.publicJson())
     }
+    /** Remove the episodes present when clearing starts, including unfinished downloads. */
+    fun clearEpisodes(): Int {
+        val completion = synchronized(this) {
+            offMain()
+            if (!loaded && !metadataExists()) return 0
+            load()
+            val ids = jobs.keys.toList()
+            ids.forEach { cancel(it) }
+            removalWorker.submit<Int> {
+                synchronized(this) { ids.count { jobs[it]?.state == "failed" } }
+            }
+        }
+        return completion.get()
+    }
+
     @Synchronized fun cancel(id: String): JSONObject {
         load()
         val job = jobs[id] ?: throw VodException("CACHE_NOT_FOUND", "此缓存已不存在")
+        if (job.state == "removing") return JSONObject().put("ok", true).put("cache", job.publicJson())
         job.cancelled = true; job.state = "removing"; job.request?.cancel(); job.downloader?.cancel(); job.thread?.interrupt()
         val active = job.thread != null
         val finished = job.finished
@@ -156,9 +173,22 @@ class VodCacheManager internal constructor(
             try {
                 runCatching { preflight?.close() }
                 if (active) finished.await()
-                removeResources(id); synchronized(this) { jobs.remove(id); persist() }
+                removeResources(id)
+                synchronized(this) {
+                    jobs.remove(id)
+                    try {
+                        persist()
+                    } catch (error: IOException) {
+                        jobs[id] = job
+                        throw error
+                    }
+                }
+            } catch (_: Exception) {
+                synchronized(this) {
+                    job.state = "failed"; job.error = "缓存移除失败，请重试"
+                    runCatching { persist() }
+                }
             }
-            catch (_: Exception) { synchronized(this) { job.state = "failed"; job.error = "缓存移除失败，请重试" } }
         }
         return JSONObject().put("ok", true).put("cache", job.publicJson())
     }
@@ -200,83 +230,131 @@ class VodCacheManager internal constructor(
 
     private fun download(job: Job) {
         Thread.interrupted()
-        val request = VodRequest()
+        var resolvedSpec: JSONObject? = null
+        var manifestValidated = false
         try {
-            synchronized(this) {
-                if (job.cancelled) return
-                job.state = "resolving"; job.request = request; job.thread = Thread.currentThread(); persist()
-            }
-            val spec = resolver(JSONObject(job.ref.toString()), request)
-            val mime = spec.getString("mimeType")
-            if (mime !in listOf("application/x-mpegURL", "application/vnd.apple.mpegurl", "video/mp4"))
-                throw VodException("CACHE_UNSUPPORTED", "暂只支持缓存 HLS 与 MP4 剧集")
-            synchronized(this) {
-                request.check(); if (job.cancelled) throw InterruptedException()
-                if (job.spec?.optString("url")?.let { it != spec.optString("url") } == true) removeResources(job.id)
-                job.spec = spec; job.title = spec.optString("title"); job.state = "downloading"; persist()
-            }
-            val item = MediaItem.Builder().setUri(Uri.parse(spec.getString("url"))).setMimeType(mime).build()
-            val network = upstream(spec)
-            if (mime != "video/mp4") validateFiniteHls(job, network, Uri.parse(spec.getString("url")), request)
-            val source = factory(job.id, network, true)
-            val downloader = if (mime == "video/mp4") ProgressiveDownloader(item, source, Executor { it.run() })
-                else HlsDownloader.Factory(source).setExecutor(Executor { it.run() }).create(item)
-            synchronized(this) { job.downloader = downloader; if (job.cancelled) throw InterruptedException() }
-            var lastSaved = 0L
-            downloader.download { total, bytes, percent -> synchronized(this) {
-                job.totalBytes = total; job.bytes = bytes; job.percent = percent
-                val now = System.nanoTime()
-                if (now - lastSaved > 1_000_000_000) { persist(); lastSaved = now }
-            } }
-            synchronized(this) {
-                if (job.cancelled || request.isCancelled() || Thread.currentThread().isInterrupted) throw InterruptedException()
-                job.resources = JSONArray()
-                cache!!.keys.filter { it.startsWith("${job.id}|") }.forEach { key -> cache!!.getCachedSpans(key).forEach { span ->
-                    job.resources.put(JSONObject().put("key", key).put("position", span.position).put("length", span.length))
-                } }
-                if (job.resources.length() == 0) throw IOException("Empty download")
-                job.state = "complete"; job.percent = 100f; persist()
-            }
-        } catch (error: Exception) {
-            synchronized(this) {
-                if (!job.cancelled) {
-                    if (error is VodException && error.code in setOf("CACHE_UNSUPPORTED", "CACHE_MANIFEST_LIMIT", "CACHE_MANIFEST_TIMEOUT")) runCatching { removeResources(job.id) }
-                    val causes = generateSequence(error as Throwable) { it.cause }.take(8).toList()
-                    val budget = causes.filterIsInstance<CacheBudgetException>().firstOrNull()
-                    val vod = causes.filterIsInstance<VodException>().firstOrNull()
-                    val http = causes.filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()
-                    val upstream = causes.filterIsInstance<DataSourceException>().firstOrNull()
-                    val errno = causes.filterIsInstance<android.system.ErrnoException>().firstOrNull()
-                    job.errorDetail = buildString {
-                        append(job.state)
-                        append(": ")
-                        append(causes.joinToString(" -> ") { it.javaClass.simpleName })
-                        http?.let { append(" HTTP ").append(it.responseCode) }
-                        upstream?.let { append(" Media3=").append(it.reason) }
-                        errno?.let { append(" errno=").append(it.errno) }
+            for (attempt in 0..MAX_NETWORK_RETRIES) {
+                val request = VodRequest()
+                try {
+                    synchronized(this) {
+                        if (job.cancelled) return
+                        job.thread = Thread.currentThread()
+                        job.request = request
+                        if (resolvedSpec == null) { job.state = "resolving"; persist() }
                     }
-                    job.errorCode = budget?.reason ?: vod?.code ?: when {
-                        http != null -> "CACHE_HTTP_${http.responseCode}"
-                        errno != null -> "CACHE_ERRNO_${errno.errno}"
-                        causes.any { it is java.net.SocketTimeoutException } -> "CACHE_TIMEOUT"
-                        causes.any { it is java.net.UnknownHostException } -> "CACHE_DNS"
-                        causes.any { it is javax.net.ssl.SSLException } -> "CACHE_TLS"
-                        causes.any { it is java.net.SocketException } -> "CACHE_SOCKET"
-                        causes.any { it is java.io.EOFException } -> "CACHE_UNEXPECTED_EOF"
-                        upstream != null -> "CACHE_MEDIA3_${upstream.reason}"
-                        error is IOException -> "CACHE_IO"
-                        else -> "CACHE_INTERNAL"
+                    val spec = resolvedSpec ?: resolver(JSONObject(job.ref.toString()), request).also { resolvedSpec = it }
+                    val mime = spec.getString("mimeType")
+                    if (mime !in listOf("application/x-mpegURL", "application/vnd.apple.mpegurl", "video/mp4"))
+                        throw VodException("CACHE_UNSUPPORTED", "暂只支持缓存 HLS 与 MP4 剧集")
+                    synchronized(this) {
+                        request.check(); if (job.cancelled) throw InterruptedException()
+                        if (job.spec?.optString("url")?.let { it != spec.optString("url") } == true) removeResources(job.id)
+                        job.spec = spec; job.title = spec.optString("title"); job.state = "downloading"; persist()
                     }
-                    android.util.Log.w("MaciVodCache", "${job.errorCode} bytes=${job.bytes} ${job.errorDetail}")
-                    job.state = "failed"; job.error = when {
-                    budget != null -> budget.publicMessage()
-                    error is VodException -> error.message.orEmpty()
-                    else -> "缓存未完成，可重新缓存以继续"
-                }; runCatching { persist() } }
+                    val item = MediaItem.Builder().setUri(Uri.parse(spec.getString("url"))).setMimeType(mime).build()
+                    val network = upstream(spec)
+                    if (mime != "video/mp4" && !manifestValidated) {
+                        validateFiniteHls(job, network, Uri.parse(spec.getString("url")), request)
+                        manifestValidated = true
+                    }
+                    val source = factory(job.id, network, true)
+                    val downloader = if (mime == "video/mp4") ProgressiveDownloader(item, source, Executor { it.run() })
+                        else HlsDownloader.Factory(source).setExecutor(Executor { it.run() }).create(item)
+                    synchronized(this) { job.downloader = downloader; if (job.cancelled) throw InterruptedException() }
+                    var lastSaved = 0L
+                    downloader.download { total, bytes, percent -> synchronized(this) {
+                        job.totalBytes = total; job.bytes = bytes; job.percent = percent
+                        val now = System.nanoTime()
+                        if (now - lastSaved > 1_000_000_000) { persist(); lastSaved = now }
+                    } }
+                    synchronized(this) {
+                        if (job.cancelled || request.isCancelled() || Thread.currentThread().isInterrupted) throw InterruptedException()
+                        job.resources = JSONArray()
+                        cache!!.keys.filter { it.startsWith("${job.id}|") }.forEach { key -> cache!!.getCachedSpans(key).forEach { span ->
+                            job.resources.put(JSONObject().put("key", key).put("position", span.position).put("length", span.length))
+                        } }
+                        if (job.resources.length() == 0) throw IOException("Empty download")
+                        job.state = "complete"; job.percent = 100f; persist()
+                    }
+                    return
+                } catch (error: Exception) {
+                    synchronized(this) {
+                        if (!job.cancelled) {
+                            val causes = generateSequence(error as Throwable) { it.cause }.take(8).toList()
+                            val budget = causes.filterIsInstance<CacheBudgetException>().firstOrNull()
+                            val vod = causes.filterIsInstance<VodException>().firstOrNull()
+                            val http = causes.filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()
+                            val upstream = causes.filterIsInstance<DataSourceException>().firstOrNull()
+                            val errno = causes.filterIsInstance<android.system.ErrnoException>().firstOrNull()
+                            val diskFull = errno?.errno == android.system.OsConstants.ENOSPC
+                            val networkFailure = when (vod?.code) {
+                                "NETWORK_TIMEOUT", "NETWORK_DISCONNECTED", "CACHE_MANIFEST_TIMEOUT" -> true
+                                null -> causes.none { it is javax.net.ssl.SSLException } &&
+                                    (upstream?.reason == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                                        upstream?.reason == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
+                                        causes.any { it is java.net.SocketTimeoutException || it is java.net.SocketException })
+                                else -> false
+                            }
+                            val retryable = budget == null && http == null && !diskFull && networkFailure
+                            if (retryable && attempt < MAX_NETWORK_RETRIES) {
+                                android.util.Log.w("MaciVodCache", "Retrying episode cache after network failure (${attempt + 1}/$MAX_NETWORK_RETRIES)")
+                                return@synchronized
+                            }
+                            if (vod?.code in setOf("CACHE_UNSUPPORTED", "CACHE_MANIFEST_LIMIT"))
+                                runCatching { removeResources(job.id) }
+                            job.errorDetail = buildString {
+                                append(job.state)
+                                append(": ")
+                                append(causes.joinToString(" -> ") { it.javaClass.simpleName })
+                                http?.let { append(" HTTP ").append(it.responseCode) }
+                                upstream?.let { append(" Media3=").append(it.reason) }
+                                errno?.let { append(" errno=").append(it.errno) }
+                            }
+                            job.errorCode = budget?.reason ?: vod?.code ?: when {
+                                http != null -> "CACHE_HTTP_${http.responseCode}"
+                                errno != null -> "CACHE_ERRNO_${errno.errno}"
+                                causes.any { it is java.net.SocketTimeoutException } -> "CACHE_TIMEOUT"
+                                causes.any { it is java.net.UnknownHostException } -> "CACHE_DNS"
+                                causes.any { it is javax.net.ssl.SSLException } -> "CACHE_TLS"
+                                causes.any { it is java.net.SocketException } -> "CACHE_SOCKET"
+                                causes.any { it is java.io.EOFException } -> "CACHE_UNEXPECTED_EOF"
+                                upstream != null -> "CACHE_MEDIA3_${upstream.reason}"
+                                error is IOException -> "CACHE_IO"
+                                else -> "CACHE_INTERNAL"
+                            }
+                            android.util.Log.w("MaciVodCache", "${job.errorCode} bytes=${job.bytes} ${job.errorDetail}")
+                            job.state = "failed"; job.error = when {
+                                budget != null -> budget.publicMessage()
+                                diskFull -> "电视可用存储不足，无法继续缓存本集"
+                                vod != null -> vod.message.orEmpty()
+                                retryable -> "网络连接中断或超时，自动重试后仍未完成，可重新缓存以继续"
+                                else -> "缓存未完成，可重新缓存以继续"
+                            }
+                            runCatching { persist() }
+                        }
+                        return
+                    }
+                } finally {
+                    request.cancel()
+                    synchronized(this) {
+                        job.request = null
+                        job.downloader = null
+                        job.preflightSource = null
+                        Thread.interrupted()
+                    }
+                }
+                try {
+                    Thread.sleep(500L shl attempt)
+                } catch (_: InterruptedException) {
+                    return
+                }
             }
         } finally {
-            request.cancel(); Thread.interrupted()
-            synchronized(this) { job.request = null; job.downloader = null; job.thread = null; job.preflightSource = null; job.finished.countDown() }
+            synchronized(this) {
+                job.thread = null
+                Thread.interrupted()
+                job.finished.countDown()
+            }
         }
     }
     private fun validateFiniteHls(job: Job, source: DataSource.Factory, uri: Uri, request: VodRequest) {
@@ -339,6 +417,7 @@ class VodCacheManager internal constructor(
         cache?.release(); database?.close()
     }
     companion object {
+        private const val MAX_NETWORK_RETRIES = 3
         @Volatile private var instance: VodCacheManager? = null
         @JvmStatic fun get(context: Context): VodCacheManager = instance ?: synchronized(this) {
             instance ?: VodCacheManager(context.applicationContext).also { instance = it }

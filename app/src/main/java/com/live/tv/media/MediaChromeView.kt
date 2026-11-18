@@ -101,18 +101,46 @@ internal class MediaChromeView(context: Context, private val actions: Actions) :
     }
     private val subtitleView = label(0xffd8d4d9.toInt(), Gravity.END)
     private val statusView = label(0xffe3dadd.toInt(), Gravity.START)
-    private val seekTime = label(Color.WHITE, Gravity.CENTER).apply {
-        typeface = BOLD
-        visibility = GONE
-        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
-    }
-    private val hideSeekTime = Runnable { seekTime.visibility = GONE }
+    private val seekTime = SeekTimeView(context)
+    private val hideSeekTime = Runnable { seekTime.update("") }
 
     fun showSeekTime(position: Long, duration: Long) {
-        seekTime.text = "${formatTime(position)} / ${formatTime(duration)}"
-        seekTime.visibility = VISIBLE
+        seekTime.update("${formatTime(position)} / ${formatTime(duration)}")
         removeCallbacks(hideSeekTime)
         postDelayed(hideSeekTime, 1500)
+    }
+
+    fun hideSeekTime() {
+        removeCallbacks(hideSeekTime)
+        seekTime.update("")
+    }
+
+    /** This HUD invalidates pixels only. The episode list need not measure for every key. */
+    private class SeekTimeView(context: Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textAlign = Paint.Align.CENTER
+            typeface = BOLD
+        }
+        private var time = ""
+
+        init { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+
+        fun update(value: String) {
+            if (time == value) return
+            time = value
+            invalidate()
+        }
+
+        override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+            paint.textSize = width * .03f
+            paint.setShadowLayer(width * .006f, 0f, width * .001f, Color.BLACK)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            if (time.isNotEmpty()) canvas.drawText(time, width * .5f,
+                (height - paint.ascent() - paint.descent()) * .5f, paint)
+        }
     }
 
     private fun formatTime(millis: Long): String {
@@ -190,8 +218,7 @@ internal class MediaChromeView(context: Context, private val actions: Actions) :
         titleView.text = title
         subtitleView.text = subtitle
         subtitleView.visibility = if (subtitle.isEmpty() && !music) GONE else VISIBLE
-        statusView.text = status
-        statusView.visibility = if (status.isEmpty()) GONE else VISIBLE
+        setStatus(status)
         updateControlsVisibility()
         lyricsView?.visibility = if (!showList) VISIBLE else GONE
 
@@ -207,6 +234,12 @@ internal class MediaChromeView(context: Context, private val actions: Actions) :
             if (listWasFocused || modeChanged && hasFocus()) focusListOrLyrics()
             requestLayout()
         }
+    }
+
+    fun setStatus(status: String) {
+        if (statusView.text.toString() == status) return
+        statusView.text = status
+        statusView.visibility = if (status.isEmpty()) GONE else VISIBLE
     }
 
     private var controlsVisible = true
@@ -245,7 +278,7 @@ internal class MediaChromeView(context: Context, private val actions: Actions) :
     override fun onDetachedFromWindow() {
         cancelRowKey()
         removeCallbacks(hideSeekTime)
-        seekTime.visibility = GONE
+        seekTime.update("")
         super.onDetachedFromWindow()
     }
 
@@ -312,9 +345,7 @@ internal class MediaChromeView(context: Context, private val actions: Actions) :
         lyricsView?.let { exact(it, listWidth, h) }
 
         var titleSize = w * .042f
-        seekTime.setTextSize(TypedValue.COMPLEX_UNIT_PX, w * .03f)
-        seekTime.setShadowLayer(w * .006f, 0f, w * .001f, Color.BLACK)
-        seekTime.measure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED))
+        exact(seekTime, w, (w * .08f).roundToInt())
         titleView.setTextSize(TypedValue.COMPLEX_UNIT_PX, titleSize)
         subtitleView.setTextSize(TypedValue.COMPLEX_UNIT_PX, w * .014f)
         titleView.setShadowLayer(w * .00625f, 0f, w * .00104f, 0xaa000000.toInt())

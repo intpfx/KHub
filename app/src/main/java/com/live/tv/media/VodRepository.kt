@@ -20,6 +20,7 @@ class VodRepository @JvmOverloads internal constructor(private val store: VodSou
     fun command(action: String, form: Map<String, String>): JSONObject = try {
         val id = when (action) {
             "vod_add_source" -> store.add(form).id
+            "vod_import_m3u8" -> store.importM3u8(form["name"].orEmpty(), form["episodes"].orEmpty()).id
             "vod_update_source" -> store.updateEndpoint(form).id
             "vod_remove_source" -> form["id"].orEmpty().also { store.remove(it) }
             else -> throw VodException("INVALID_ACTION", "未知点播操作")
@@ -35,11 +36,15 @@ class VodRepository @JvmOverloads internal constructor(private val store: VodSou
         return result
     }
 
-    fun search(query: String, page: Int, request: VodRequest): JSONObject {
+    fun search(query: String, page: Int, request: VodRequest): JSONObject =
+        search(query, page, request, null)
+
+    internal fun search(query: String, page: Int, request: VodRequest,
+        onSourceItems: ((List<JSONObject>) -> Unit)?): JSONObject {
         val term = query.trim()
         if (term.isEmpty() || term.length > 200 || term.any { it.code < 32 || it.code == 127 } || page !in 1..10_000)
             throw VodException("INVALID_QUERY", "请填写 1–200 字的搜索词")
-        return aggregate(term, page, request, "search")
+        return aggregate(term, page, request, "search", onSourceItems)
     }
 
     /** The poster wall requests one page at a time, with the same bounded fanout as search. */
@@ -49,7 +54,8 @@ class VodRepository @JvmOverloads internal constructor(private val store: VodSou
     }
 
     /** One bounded operation across a configuration snapshot; completion order never changes result order. */
-    private fun aggregate(term: String, page: Int, request: VodRequest, kind: String): JSONObject {
+    private fun aggregate(term: String, page: Int, request: VodRequest, kind: String,
+        onSourceItems: ((List<JSONObject>) -> Unit)? = null): JSONObject {
         request.check()
         val snapshot = store.state()
         if (snapshot.optString("errorCode").isNotEmpty()) throw VodException("SOURCE_STORE", "点播来源读取失败，请保留原文件后恢复")
@@ -83,6 +89,14 @@ class VodRepository @JvmOverloads internal constructor(private val store: VodSou
                 val (index, result) = ready.get()
                 results[index] = result
                 remaining--
+                if (onSourceItems != null && result.source != null && result.catalog != null) {
+                    try {
+                        current(result.source, request)
+                    } catch (_: VodException) {
+                        continue
+                    }
+                    onSourceItems(sourceItems(result.catalog, sources[index]))
+                }
             }
             request.check()
             // Recheck even early completions after other sources finish. No deleted/changed source
@@ -110,13 +124,7 @@ class VodRepository @JvmOverloads internal constructor(private val store: VodSou
                     status.put("status", "success").put("hasMore", more)
                     if (catalog.has("searchLimit")) status.put("searchLimit", catalog.getInt("searchLimit"))
                         .put("truncated", catalog.optBoolean("truncated"))
-                    val seen = mutableSetOf<String>()
-                    val rows = catalog.getJSONArray("items")
-                    for (itemIndex in 0 until rows.length()) {
-                        val item = rows.getJSONObject(itemIndex)
-                        if (seen.add(item.getString("vodId"))) items.put(item
-                            .put("sourceName", row.getString("name")).put("revision", row.getInt("revision")).put("epoch", row.getInt("epoch")))
-                    }
+                    sourceItems(catalog, row).forEach { items.put(it) }
                 }
                 statuses.put(status)
             }
@@ -133,6 +141,17 @@ class VodRepository @JvmOverloads internal constructor(private val store: VodSou
             scope.cancel()
             futures.forEach { it.cancel(true) }
             pool.shutdownNow()
+        }
+    }
+
+    private fun sourceItems(catalog: JSONObject, source: JSONObject): List<JSONObject> {
+        val rows = catalog.getJSONArray("items")
+        val seen = mutableSetOf<String>()
+        return (0 until rows.length()).mapNotNull { index ->
+            val item = rows.getJSONObject(index)
+            if (!seen.add(item.getString("vodId"))) return@mapNotNull null
+            JSONObject(item.toString()).put("sourceName", source.getString("name"))
+                .put("revision", source.getInt("revision")).put("epoch", source.getInt("epoch"))
         }
     }
 

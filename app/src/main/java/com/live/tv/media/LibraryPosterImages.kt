@@ -40,11 +40,14 @@ internal class LibraryPosterImages internal constructor(private val store: Poste
     override fun load(view: ImageView, url: String) = load(view, store.address(url), null)
     override fun load(view: ImageView, work: LibraryWork) = load(view, store.address(work), work)
 
-    private fun load(view: ImageView, address: PosterAddress?, work: LibraryWork?) {
+    fun loadKeepingPlaceholder(view: ImageView, work: LibraryWork) =
+        load(view, store.address(work), work, keepPlaceholder = true)
+
+    private fun load(view: ImageView, address: PosterAddress?, work: LibraryWork?, keepPlaceholder: Boolean = false) {
         val key = address?.key
         if (!closed && key != null && pending[view]?.url == key && pending[view]?.work?.key == work?.key) return
         pending.remove(view)?.let(store::remove)
-        view.setImageDrawable(null)
+        if (!keepPlaceholder) view.setImageDrawable(null)
         if (closed) return
         if (address == null) return
         store.cached(address.key)?.let { view.setImageBitmap(it); return }
@@ -150,6 +153,7 @@ internal class PosterImageStore(
 ) {
     private class Job(val address: PosterAddress) {
         val url get() = address.key
+        val xiguaOrigin = address.lookup == null && url.toHttpUrlOrNull()?.host == "vod.xiguazyimg.com"
         val request = VodRequest()
         val observers = linkedSetOf<PosterSubscription>()
         val prefetchOwners = mutableMapOf<Any, MutableList<LibraryWork?>>()
@@ -174,6 +178,7 @@ internal class PosterImageStore(
     private val jobs = linkedMapOf<String, Job>()
     private var active = 0
     private var activeFallback = 0
+    private var xiguaOriginActive = false
 
     @Synchronized fun cached(url: String): Bitmap? {
         invalidateLanding()
@@ -331,14 +336,17 @@ internal class PosterImageStore(
     /** Called with this monitor held; workers select visible jobs before any queued speculation. */
     private fun pump() {
         while (active < 2) {
-            val next = jobs.values.firstOrNull { !it.running && it.observers.isNotEmpty() && it.address.lookup == null }
-                ?: jobs.values.firstOrNull { !it.running && it.observers.isNotEmpty() && it.address.lookup != null && activeFallback == 0 }
-                ?: jobs.values.filter { !it.running && (it.address.lookup == null || activeFallback == 0) && warmRank(it) != Int.MAX_VALUE }
+            // Leave a slot free for other poster hosts when the Xigua CDN is timing out.
+            val ready = jobs.values.filter { !it.running && (!it.xiguaOrigin || !xiguaOriginActive) }
+            val next = ready.firstOrNull { it.observers.isNotEmpty() && it.address.lookup == null }
+                ?: ready.firstOrNull { it.observers.isNotEmpty() && it.address.lookup != null && activeFallback == 0 }
+                ?: ready.filter { (it.address.lookup == null || activeFallback == 0) && warmRank(it) != Int.MAX_VALUE }
                     .minByOrNull(::warmRank)
-                ?: jobs.values.firstOrNull { !it.running && it.address.lookup == null }
-                ?: jobs.values.firstOrNull { !it.running && activeFallback == 0 } ?: return
+                ?: ready.firstOrNull { it.address.lookup == null }
+                ?: ready.firstOrNull { activeFallback == 0 } ?: return
             next.running = true; active++
             if (next.address.lookup != null) activeFallback++
+            if (next.xiguaOrigin) xiguaOriginActive = true
             executor.execute {
                 val request = next.request.bounded(if (next.address.lookup == null) 8000 else 18_000)
                 val bitmap = try {
@@ -350,6 +358,7 @@ internal class PosterImageStore(
                 synchronized(this) {
                     active--
                     if (next.address.lookup != null) activeFallback--
+                    if (next.xiguaOrigin) xiguaOriginActive = false
                     invalidateLanding()
                     if (jobs[next.url] === next) {
                         jobs.remove(next.url)

@@ -47,6 +47,56 @@ class VodRepositoryTest {
         assertTrue(response.toString(), response.getBoolean("ok"))
         return response.getString("id")
     }
+    @Test fun xiguaPresetUsesTheVerifiedJsonEndpointAndReusesAnExistingSource() {
+        val endpoint = "https://xgzy8.tv/api.php/provide/vod/from/xiguam3u8/at/json/"
+        val preset = mapOf("preset" to "xigua")
+        val fresh = VodRepository(store(), OkHttpClient())
+        val added = fresh.command("vod_add_source", preset)
+        assertTrue(added.getBoolean("ok"))
+        val source = fresh.state().getJSONArray("sources").getJSONObject(0)
+        assertEquals("西瓜资源站", source.getString("name"))
+        assertEquals(endpoint, source.getString("url"))
+        assertEquals(added.getString("id"), fresh.command("vod_add_source", preset).getString("id"))
+
+        val existing = VodRepository(store(), OkHttpClient())
+        val manualId = add(existing, mapOf("url" to endpoint.trimEnd('/')))
+        assertEquals(manualId, existing.command("vod_add_source", preset).getString("id"))
+        assertEquals(1, existing.state().getJSONArray("sources").length())
+    }
+
+    @Test fun importedEpisodesPersistAndResolveWithoutAnExternalCatalog() {
+        val file = File(temporary.newFolder(), "vod.json")
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            assertEquals("video.example", chain.request().url.host)
+            answer(chain.request(), "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\npart.ts\n#EXT-X-ENDLIST\n",
+                "application/vnd.apple.mpegurl")
+        }.build()
+        val repository = VodRepository(store(file), client)
+        val form = mapOf("name" to "导入的综艺", "episodes" to
+            "先导片 | https://video.example/first.m3u8?token=private\nhttps://video.example/second.m3u8")
+        val result = repository.command("vod_import_m3u8", form)
+        assertTrue(result.getBoolean("ok"))
+        val id = result.getString("id")
+        assertEquals(id, repository.command("vod_import_m3u8", form).getString("id"))
+        assertFalse(repository.state().toString().contains("video.example"))
+        assertFalse(file.readText().contains("token=private"))
+
+        val reopened = VodRepository(store(file), client)
+        val item = reopened.search("综艺", 1, VodRequest()).getJSONObject("search").getJSONArray("items").getJSONObject(0)
+        assertEquals(id, item.getString("sourceId"))
+        val detail = reopened.detail(id, item.getString("vodId"), VodRequest())
+        val episodes = detail.getJSONArray("lines").getJSONObject(0).getJSONArray("episodes")
+        assertEquals("先导片", episodes.getJSONObject(0).getString("label"))
+        assertEquals("第 2 集", episodes.getJSONObject(1).getString("label"))
+        val playback = reopened.resolve(ref(detail), VodRequest())
+        assertEquals("https://video.example/first.m3u8?token=private", playback.getString("url"))
+        assertEquals("2", playback.getJSONObject("nextEpisode").getString("episodeKey"))
+
+        val invalid = reopened.command("vod_import_m3u8", form + ("episodes" to "https://video.example/a.mp4"))
+        assertEquals("INVALID_SOURCE", invalid.getString("code"))
+        assertEquals(1, reopened.state().getJSONArray("sources").length())
+    }
+
     private fun catalogFixture() = JSONObject().put("code", 1).put("page", "1").put("pagecount", "2").put("limit", 1)
         .put("class", JSONArray().put(JSONObject().put("type_id", 2).put("type_name", "剧集")))
         .put("list", JSONArray().put(JSONObject().put("vod_id", "series:001").put("vod_name", "<b>示例</b>")

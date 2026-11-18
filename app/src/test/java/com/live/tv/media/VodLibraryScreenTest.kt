@@ -75,6 +75,28 @@ class VodLibraryScreenTest {
     }
     private fun dispose(c: ActivityController<VodLibraryActivity>) { c.pause().stop().destroy() }
 
+    @Test fun coldStartKeepsLastPlayedWorkEvenWhenItIsAbsentFromTheDefaultCatalogue() {
+        val app = RuntimeEnvironment.getApplication()
+        val watched = LibraryWork("source", "catalogue-absent", 1, 2, "上次播放的片")
+        val ref = watched.reference("line", "episode-7")
+        RecentVodHistory(app).record(watched, ref, "第 7 集")
+        val wrong = LibraryWork("source", "夹具影片 1", 1, 2, "夹具影片 1")
+        val snapshot = JSONObject().put("workKey", wrong.key).put("title", wrong.title)
+            .put("lineId", "line").put("selectedEpisode", "episode-1").put("episodes", JSONArray().put(
+                JSONObject().put("label", "第 1 集").put("reference", wrong.reference("line", "episode-1"))))
+        val prefs = app.getSharedPreferences("vod-session", 0)
+        prefs.edit().putString("snapshot", snapshot.toString()).apply()
+
+        val controller = open()
+        val activity = controller.get()
+        try {
+            await { activity.libraryModel.page == 1 && text(activity, "library-detail-title") == watched.title }
+            assertEquals(watched.key, activity.javaClass.getDeclaredField("selectedWorkKey").apply { isAccessible = true }.get(activity))
+            assertEquals("episode-7", activity.javaClass.getDeclaredField("selectedEpisode").apply { isAccessible = true }.get(activity))
+            assertEquals(snapshot.toString(), prefs.getString("snapshot", null))
+        } finally { dispose(controller) }
+    }
+
     @Test fun currentEpisodeOwnsInitialFocusAndFramesAreBelow() {
         val c = open(); val a = c.get()
         try {

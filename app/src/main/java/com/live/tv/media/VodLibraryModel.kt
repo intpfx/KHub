@@ -258,7 +258,11 @@ internal class VodLibraryModel {
             .filter { !cachedOnly || it.completed.isNotEmpty() }
             .sortedWith(compareByDescending<LibraryWork> { it.completed.isNotEmpty() }.thenByDescending { it.caches.maxOfOrNull(LibraryCache::lastPlayedAt) ?: 0 })
         val keys = cached.map { it.key }.toSet()
-        return cached + if (cachedOnly) emptyList() else online.values.filter { it.key !in keys }
+        if (cachedOnly) return cached
+        val works = cached + online.values.filter { it.key !in keys }
+        return VodSourcePriority.orderTitles(works, LibraryWork::title) {
+            if (it.current) VodSourcePriority.rank(it.sourceName) else Int.MAX_VALUE
+        }
     }
 
     companion object {

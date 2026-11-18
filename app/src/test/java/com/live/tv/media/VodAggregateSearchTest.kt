@@ -45,6 +45,66 @@ class VodAggregateSearchTest {
         try { block(); fail("Expected $code") } catch (error: VodException) { assertEquals(code, error.code) }
     }
 
+    @Test fun preferredSourcesRankAheadOfPreviouslyConfiguredSources() {
+        val repo = repository { chain -> response(chain.request()) }
+        val other = add(repo, "other")
+        val modu = add(repo, "魔都资源")
+        val threeSixty = add(repo, "360资源")
+        val xigua = add(repo, "西瓜资源站")
+        val expected = listOf(xigua, threeSixty, modu, other)
+        val configured = repo.state().getJSONArray("sources")
+        assertEquals(expected, (0 until configured.length()).map { configured.getJSONObject(it).getString("id") })
+        val matches = search(repo).getJSONObject("search").getJSONArray("items")
+        assertEquals(expected, (0 until matches.length()).map { matches.getJSONObject(it).getString("sourceId") })
+    }
+
+    @Test fun streamingSearchPublishesAvailableSourceBeforeEarlierSlowSource() {
+        val release = CountDownLatch(1)
+        val early = CountDownLatch(1)
+        val repo = repository { chain ->
+            if (chain.request().url.host == "slow.example") assertTrue(release.await(5, TimeUnit.SECONDS))
+            response(chain.request(), duplicates = true)
+        }
+        val slow = add(repo, "slow")
+        val fast = add(repo, "fast")
+        val batches = CopyOnWriteArrayList<String>()
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val final = executor.submit<JSONObject> {
+                repo.search("片名", 1, VodRequest()) { rows ->
+                    assertEquals(1, rows.size)
+                    batches.add(rows.single().getString("sourceId"))
+                    early.countDown()
+                }
+            }
+            assertTrue(early.await(3, TimeUnit.SECONDS))
+            assertEquals(listOf(fast), batches.toList())
+            assertFalse(final.isDone)
+            release.countDown()
+            val items = final.get(5, TimeUnit.SECONDS).getJSONObject("search").getJSONArray("items")
+            assertEquals(listOf(fast, slow), batches.toList())
+            assertEquals(listOf(slow, fast), (0 until items.length()).map { items.getJSONObject(it).getString("sourceId") })
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test fun xiguaSearchMatchesChineseTitlesEnteredWithSpaces() {
+        val queries = CopyOnWriteArrayList<Pair<String, String?>>()
+        val repo = repository { chain ->
+            queries.add(chain.request().url.host to chain.request().url.queryParameter("wd"))
+            response(chain.request())
+        }
+        add(repo, "xigua", mapOf("url" to "https://xgzy8.tv/api.php/provide/vod/from/xiguam3u8/at/json/"))
+        add(repo, "ordinary")
+        assertTrue(repo.search("现在就出发　第四季", 1, VodRequest()).getBoolean("ok"))
+        assertTrue(repo.search("The Office", 1, VodRequest()).getBoolean("ok"))
+        assertTrue(queries.contains("xgzy8.tv" to "现在就出发第四季"))
+        assertTrue(queries.contains("ordinary.example" to "现在就出发　第四季"))
+        assertTrue(queries.contains("xgzy8.tv" to "The Office"))
+    }
+
     @Test fun posterWallBrowseUsesEveryEligibleSourceAndAdvancesWithoutSearchOrCategory() {
         val requests = CopyOnWriteArrayList<Request>()
         val repo = repository { chain -> requests.add(chain.request()); response(chain.request(), 3) }

@@ -82,6 +82,10 @@ class VodLibraryActivity : Activity() {
     }
 
     private val main = Handler(Looper.getMainLooper())
+    private val remoteSeek = VodRemoteSeek(main) { position, duration ->
+        chrome.setTitleProgress(position, duration, resourceTheme)
+        chrome.showSeekTime(position, duration)
+    }
     private val searchScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val data get() = libraryData!!
     private val images get() = libraryImages!!
@@ -134,6 +138,9 @@ class VodLibraryActivity : Activity() {
     private var pendingAutoPlay = false
     private var pendingUserPlay = false
     private var showingFrame = false
+    private var searchArtwork: Bitmap? = null
+    private var heroFading = false
+    private var artworkRequestedFor: String? = null
     private var renderedFrame = false
     private var frameSource: MediaSource.Factory? = null
     private var preloadFrameSource: MediaSource.Factory? = null
@@ -144,8 +151,21 @@ class VodLibraryActivity : Activity() {
         if (player?.isPlaying == true && dialog?.isShowing != true &&
             !globalSearch.isOpen() && searchOverlay.visibility != View.VISIBLE) hideChrome()
     }
+    private val startupTimeout = Runnable {
+        val instance = player ?: return@Runnable
+        if (!active || renderedFrame || instance.playbackState != Player.STATE_BUFFERING) return@Runnable
+        val tryingToPlay = instance.playWhenReady
+        instance.pause()
+        instance.stop()
+        showChrome()
+        showDetailMessage(if (tryingToPlay) "起播超时，按确认重试或切换来源" else "预览加载超时，按确认播放")
+    }
     private var playerWorkKey = ""
     private var lastFrameWorkKey = ""
+    private var restoredWorkKey = ""
+    private var lastPlayedEpisodeKey = ""
+    private var resumeEpisodeKey = ""
+    private var resumePlayer: ExoPlayer? = null
     private var sessionWorkKey = ""
     private var sessionSourceId = ""
     private var sessionVodId = ""
@@ -239,7 +259,10 @@ class VodLibraryActivity : Activity() {
         getSharedPreferences("app-session", MODE_PRIVATE).edit().putString("last_screen", "vod").apply()
         refreshLocal(false)
         scheduleCachePoll()
+        val suspendedPlayer = resumePlayer
+        resumePlayer = null
         if (openSearchResult()) return
+        if (suspendedPlayer != null && player === suspendedPlayer) suspendedPlayer.play()
         if (work?.music == null && work != null && detail == null) loadDetail(onlineDetailRequested)
         else if (detail != null) renderDetail(false)
     }
@@ -268,13 +291,17 @@ class VodLibraryActivity : Activity() {
             row.optString("title").take(512).ifBlank { "未命名影片" },
             poster = row.optString("poster").take(8192), sourceName = row.optString("sourceName").take(512))
         main.removeCallbacks(preview)
+        restoredWorkKey = ""
+        resumeEpisodeKey = ""
         spotlightWork = item
+        searchArtwork = VodSearchPreview.takePoster(item.key)
+        if (artworkRequestedFor != null) images.load(hero.image, "")
+        artworkRequestedFor = null
         cachedOnly = false
         selectedWorkKey = item.key
-        if (reference != null) {
-            pendingAutoPlay = false
-            pendingUserPlay = false
-        }
+        pendingAutoPlay = reference == null
+        pendingUserPlay = false
+        showChrome()
         renderWall()
         if (reference != null) {
             val key = LibraryReference.key(reference)
@@ -288,6 +315,8 @@ class VodLibraryActivity : Activity() {
             } else {
                 play(episode)
             }
+        } else if (pendingAutoPlay && detail?.work?.key == item.key) {
+            renderDetail(false)
         }
         chrome.resetFocus()
         return true
@@ -301,11 +330,32 @@ class VodLibraryActivity : Activity() {
     }
 
     override fun onPause() {
+        remoteSeek.commit()
+        remoteSeek.reset()
         main.removeCallbacks(recordWatchProgress)
-        val wasPlaying = player?.playWhenReady == true
-        if (wasPlaying) player?.pause()
+        main.removeCallbacks(startupTimeout)
+        val instance = player
+        val wasPlaying = instance?.playWhenReady == true
+        val state = instance?.playbackState
+        val shouldResume = wasPlaying && (state == Player.STATE_BUFFERING || state == Player.STATE_READY)
+        resumePlayer = instance.takeIf { shouldResume }
         savePlayerProgress()
-        if (wasPlaying) captureFrame()
+        val episodeKey = playerRef?.let(LibraryReference::key)
+        if (episodeKey != null && episodeKey == lastPlayedEpisodeKey) {
+            resumeEpisodeKey = if (shouldResume) episodeKey else ""
+            getSharedPreferences("vod-session", MODE_PRIVATE).edit()
+                .putString("resumeEpisodeKey", resumeEpisodeKey).apply()
+        }
+        if (wasPlaying) {
+            instance?.pause()
+            captureFrame()
+        }
+        if (instance == null && playerRequest != null) {
+            playerGeneration++
+            playerRequest?.cancel()
+            playerRequest = null
+            preparedKey = ""
+        }
         releasePreload()
         main.removeCallbacks(cachePoll); cachePollGeneration++; cachePollInFlight = false
         active = false; catalogGeneration++; detailGeneration++; actionGeneration++; localGeneration++
@@ -338,14 +388,7 @@ class VodLibraryActivity : Activity() {
             ::searchOverlay.isInitialized && searchOverlay.visibility == View.VISIBLE -> hideSearchOverlay()
             dialog?.isShowing == true -> dialog?.dismiss()
             ::chrome.isInitialized && !uiHidden -> hideChrome()
-            else -> {
-                player?.takeIf { it.playWhenReady }?.let {
-                    it.pause()
-                    savePlayerProgress()
-                    captureFrame()
-                }
-                DesktopMode.returnToHome(this)
-            }
+            else -> DesktopMode.returnToHome(this)
         }
     }
 
@@ -365,15 +408,10 @@ class VodLibraryActivity : Activity() {
         if (searchOverlay.visibility != View.VISIBLE) {
             if (key == KeyEvent.KEYCODE_DPAD_LEFT || key == KeyEvent.KEYCODE_DPAD_RIGHT) {
                 if (event.action == KeyEvent.ACTION_DOWN) {
-                    player?.takeIf { it.isCurrentMediaItemSeekable && it.duration > 0 }?.let {
-                        val position = (it.currentPosition + if (key == KeyEvent.KEYCODE_DPAD_LEFT) -10_000 else 10_000)
-                            .coerceIn(0, it.duration)
-                        it.seekTo(position)
-                        savePlayerProgress()
-                        renderChrome()
-                        chrome.setTitleProgress(position, it.duration, resourceTheme)
-                        chrome.showSeekTime(position, it.duration)
-                    }
+                    val delta = if (key == KeyEvent.KEYCODE_DPAD_LEFT) -10_000L else 10_000L
+                    player?.let { remoteSeek.step(it, delta, event.repeatCount > 0, event.eventTime) }
+                } else if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+                    remoteSeek.keyUp()
                 }
                 return true
             }
@@ -435,45 +473,67 @@ class VodLibraryActivity : Activity() {
             .hideSoftInputFromWindow(root.windowToken, 0)
     }
 
-    private fun saveSessionSnapshot() {
-        val current = work ?: return
-        val line = detail?.lines?.firstOrNull { it.id == selectedLine } ?: return
-        val episodes = JSONArray()
-        line.episodes.forEach { episode ->
-            episodes.put(JSONObject().put("label", episode.label)
-                .put("reference", JSONObject(episode.reference.toString()))
-                .put("cached", episode.cached).put("cacheState", episode.cacheState)
-                .put("percent", episode.percent))
-        }
-        val json = JSONObject().put("workKey", current.key).put("title", current.title)
+    private fun saveSessionSnapshot(current: LibraryWork, reference: JSONObject, episodeLabel: String) {
+        if (LibraryReference.workKey(reference) != current.key) return
+        val lineId = reference.getString("lineId")
+        val line = detail?.takeIf { it.work.key == current.key }?.lines?.firstOrNull { it.id == lineId }
+        val actual = LibraryEpisode(episodeLabel, reference)
+        val entries = line?.episodes?.takeIf { list ->
+            list.any { LibraryReference.key(it.reference) == LibraryReference.key(reference) }
+        } ?: listOf(actual)
+        val episodes = JSONArray(entries.map { episode ->
+            JSONObject().put("label", episode.label).put("reference", JSONObject(episode.reference.toString()))
+                .put("cached", episode.cached).put("cacheState", episode.cacheState).put("percent", episode.percent)
+        })
+        val snapshot = JSONObject().put("played", true).put("workKey", current.key).put("title", current.title)
             .put("sourceId", current.sourceId).put("vodId", current.vodId)
-            .put("lineId", line.id).put("lineLabel", line.label)
-            .put("selectedEpisode", selectedEpisode).put("episodes", episodes)
-        getSharedPreferences("vod-session", MODE_PRIVATE).edit().putString("snapshot", json.toString()).apply()
-        sessionWorkKey = current.key; sessionSourceId = current.sourceId; sessionVodId = current.vodId
+            .put("sourceName", current.sourceName).put("poster", current.poster)
+            .put("lineId", lineId).put("lineLabel", line?.label.orEmpty())
+            .put("selectedEpisode", reference.getString("episodeKey")).put("episodes", episodes)
+        lastPlayedEpisodeKey = LibraryReference.key(reference)
+        getSharedPreferences("vod-session", MODE_PRIVATE).edit()
+            .putString("snapshot", snapshot.toString())
+            .putString("resumeEpisodeKey", lastPlayedEpisodeKey).apply()
     }
 
     private fun restoreSessionSnapshot() {
-        val raw = getSharedPreferences("vod-session", MODE_PRIVATE).getString("snapshot", null) ?: return
-        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return
-        val key = json.optString("workKey")
-        val title = json.optString("title")
-        val rows = json.optJSONArray("episodes") ?: JSONArray()
-        if (key.isEmpty() || rows.length() == 0) return
-        val episodes = (0 until rows.length()).mapNotNull { index ->
-            val row = rows.optJSONObject(index) ?: return@mapNotNull null
-            val ref = row.optJSONObject("reference") ?: return@mapNotNull null
-            LibraryEpisode(row.optString("label"), ref, row.optBoolean("cached"),
-                row.optString("cacheState"), row.optInt("percent", -1))
+        val prefs = getSharedPreferences("vod-session", MODE_PRIVATE)
+        val raw = prefs.getString("snapshot", null)
+        val snapshot = raw?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject()
+        val rows = snapshot.optJSONArray("episodes") ?: JSONArray()
+        val savedEpisodes = (0 until rows.length()).mapNotNull { index ->
+            val entry = rows.optJSONObject(index) ?: return@mapNotNull null
+            val ref = LibraryReference.read(entry.optJSONObject("reference")) ?: return@mapNotNull null
+            if (LibraryReference.workKey(ref) != snapshot.optString("workKey") ||
+                ref.optString("lineId") != snapshot.optString("lineId")) return@mapNotNull null
+            LibraryEpisode(entry.optString("label"), ref, entry.optBoolean("cached"),
+                entry.optString("cacheState"), entry.optInt("percent", -1))
         }
-        if (episodes.isEmpty()) return
-        sessionWorkKey = key
-        sessionSourceId = json.optString("sourceId"); sessionVodId = json.optString("vodId")
-        playerTitle = title
-        selectedLine = json.optString("lineId")
-        selectedEpisode = json.optString("selectedEpisode")
-        episodeAdapter.items = episodes
-        renderEpisodes()
+        val saved = savedEpisodes.firstOrNull { it.reference.optString("episodeKey") == snapshot.optString("selectedEpisode") }
+            ?: savedEpisodes.firstOrNull()
+        val recent = if (snapshot.optBoolean("played") && saved != null) null else RecentVodHistory(this).entries().firstOrNull()
+        val reference = LibraryReference.read(recent) ?: saved?.reference ?: return
+        val title = (recent ?: snapshot).optString("title").ifBlank { "未命名影片" }
+        val item = LibraryWork(reference.getString("sourceId"), reference.getString("vodId"),
+            reference.getInt("revision"), reference.getInt("epoch"), title,
+            poster = (recent ?: snapshot).optString("poster"), sourceName = (recent ?: snapshot).optString("sourceName"))
+        val list = savedEpisodes.takeIf { entries ->
+            entries.any { LibraryReference.key(it.reference) == LibraryReference.key(reference) }
+        } ?: listOf(LibraryEpisode(recent?.optString("episodeLabel").orEmpty(), reference))
+        sessionWorkKey = item.key
+        sessionSourceId = item.sourceId
+        sessionVodId = item.vodId
+        restoredWorkKey = item.key
+        lastPlayedEpisodeKey = LibraryReference.key(reference)
+        resumeEpisodeKey = prefs.getString("resumeEpisodeKey", "").orEmpty()
+            .takeIf { recent == null && snapshot.optBoolean("played") && it == lastPlayedEpisodeKey }.orEmpty()
+        selectedWorkKey = item.key
+        spotlightWork = item
+        work = item
+        playerTitle = item.title
+        selectedLine = reference.getString("lineId")
+        selectedEpisode = reference.getString("episodeKey")
+        setEpisodeItems(list)
     }
 
     private fun showLastFrame() {
@@ -489,7 +549,6 @@ class VodLibraryActivity : Activity() {
         lastFrameWorkKey = prefs.getString("__last_work_key", "").orEmpty()
         playerTitle = prefs.getString("__last_title", "").orEmpty()
         renderChrome()
-        hero.visibility = View.GONE
     }
 
     private fun buildSearchOverlay() {
@@ -592,6 +651,7 @@ class VodLibraryActivity : Activity() {
         wall.addView(playerView, FrameLayout.LayoutParams(-1, -1))
         hero = LibraryPosterView(this).apply {
             id = View.generateViewId(); tag = "library-hero"
+            hideTitle()
             isFocusable = true; isFocusableInTouchMode = true
             setOnClickListener {
                 val item = posters.items.getOrNull(selectedCardIndex)
@@ -632,14 +692,26 @@ class VodLibraryActivity : Activity() {
             ?: framePrefs.getString("__last_frame", null)?.takeIf { item.key == lastFrameWorkKey }
         val cachedFrame = frameId?.let(::loadCachedFrame)
         if (cachedFrame != null) {
+            hero.image.scaleType = ImageView.ScaleType.CENTER_CROP
             hero.image.setImageBitmap(cachedFrame)
             hero.visibility = View.VISIBLE
             showingFrame = true
             PlaybackThemeColor.fromBitmap(cachedFrame)?.let { resourceTheme = it }
         } else if (music != null) {
             loadMusicArtwork(hero.image, music)
+        } else if (spotlightWork?.key == item.key) {
+            hero.visibility = View.VISIBLE
+            hero.image.scaleType = ImageView.ScaleType.FIT_CENTER
+            val bitmap = searchArtwork
+            if (bitmap != null) hero.image.setImageBitmap(bitmap)
+            else if (artworkRequestedFor != item.key) {
+                artworkRequestedFor = item.key
+                images.load(hero.image, item)
+            }
         } else {
-            // No poster request: unplayed videos start on a dark card until their opening media renders.
+            showingFrame = false
+            if (artworkRequestedFor != null) images.load(hero.image, "")
+            artworkRequestedFor = null
             hero.image.setImageDrawable(null)
         }
     }
@@ -819,6 +891,7 @@ class VodLibraryActivity : Activity() {
     /** Warm the next catalogue resource's first episode so a right switch shows video immediately. */
     private fun preloadNextResource() {
         if (!active) return
+        if (!VodRenderers.supportsParallelPlayback) { releasePreload(); return }
         val next = posters.items.getOrNull(selectedCardIndex + 1)
         if (next == null || next.music != null) { releasePreload(); return }
         if (preloadWorkKey == next.key && preloadPlayer != null) return
@@ -856,7 +929,7 @@ class VodLibraryActivity : Activity() {
                 main.post {
                     if (!active || generation != preloadGeneration || selectedWorkKey != ownerKey) return@post
                     val source = DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http))
-                    val instance = ExoPlayer.Builder(this).setMediaSourceFactory(source).build()
+                    val instance = ExoPlayer.Builder(this, VodRenderers.create(this)).setMediaSourceFactory(source).build()
                     instance.setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA)
                         .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
                     instance.setMediaItem(MediaItem.Builder().setUri(uri).setMediaId(id)
@@ -1017,6 +1090,7 @@ class VodLibraryActivity : Activity() {
     }
 
     private fun togglePlayback() {
+        remoteSeek.commit()
         val p = player
         if (p == null) {
             val episode = episodeAdapter.items.getOrNull(episodeAdapter.items.indexOfFirst {
@@ -1027,6 +1101,7 @@ class VodLibraryActivity : Activity() {
         }
         if (p.playWhenReady) {
             p.pause()
+            if (p.playbackState == Player.STATE_BUFFERING) showDetailMessage("已暂停")
             savePlayerProgress()
             captureFrame()
             renderEpisodes()
@@ -1034,6 +1109,7 @@ class VodLibraryActivity : Activity() {
         } else {
             if (p.playbackState == Player.STATE_IDLE) p.prepare()
             p.play()
+            if (p.playbackState == Player.STATE_BUFFERING) showDetailMessage("正在缓冲…")
             revealVideo(p)
             scheduleHideChrome()
         }
@@ -1055,13 +1131,16 @@ class VodLibraryActivity : Activity() {
     }
 
     private fun releasePlayer(save: Boolean = true) {
+        remoteSeek.reset()
+        if (::chrome.isInitialized) chrome.hideSeekTime()
         main.removeCallbacks(recordWatchProgress)
+        main.removeCallbacks(startupTimeout)
         playerGeneration++; playerRequest?.cancel(); playerRequest = null
         if (save) savePlayerProgress()
         player?.release(); player = null
         playerView.player = null; playerView.visibility = View.GONE
         if (::hero.isInitialized) {
-            hero.animate().cancel(); hero.alpha = 1f; hero.visibility = View.VISIBLE
+            hero.animate().cancel(); heroFading = false; hero.alpha = 1f; hero.visibility = View.VISIBLE
         }
         playerRef = null; playerId = ""; renderedFrame = false; frameSource = null
         updatePlaybackControls()
@@ -1070,14 +1149,27 @@ class VodLibraryActivity : Activity() {
     /** Once a frame is ready, play intent owns the surface even during short buffering gaps. */
     private fun revealVideo(instance: ExoPlayer) {
         if (player !== instance || !renderedFrame || !instance.playWhenReady) return
-        hero.animate().cancel()
-        hero.visibility = View.GONE
-        hero.alpha = 1f
-        showingFrame = false
+        if (hero.visibility != View.VISIBLE || heroFading) return
+        if (spotlightWork?.key != work?.key || spotlightWork == null || hero.image.drawable == null) {
+            hero.visibility = View.GONE
+            showingFrame = false
+            return
+        }
+        heroFading = true
+        hero.animate().alpha(0f).setDuration(160).withEndAction {
+            heroFading = false
+            if (player === instance) {
+                hero.visibility = View.GONE
+                hero.alpha = 1f
+                showingFrame = false
+            }
+        }.start()
     }
 
     private fun recordRecentPlayback(current: LibraryWork?, reference: JSONObject, label: String) {
-        if (current != null) RecentVodHistory(this).record(current, reference, label)
+        if (current == null || LibraryReference.workKey(reference) != current.key) return
+        RecentVodHistory(this).record(current, reference, label)
+        saveSessionSnapshot(current, reference, label)
     }
 
     private fun startEpisode(episode: LibraryEpisode, autoplay: Boolean) {
@@ -1085,6 +1177,7 @@ class VodLibraryActivity : Activity() {
         com.live.tv.MainActivity.releaseLiveForPlayback()
         main.removeCallbacks(preview)
         releasePlayer(true)
+        showChrome()
         val generation = ++playerGeneration
         val request = VodRequest(); playerRequest = request
         val downloads = VodCacheManager.get(this)
@@ -1100,11 +1193,14 @@ class VodLibraryActivity : Activity() {
                 request.check()
                 val cached = downloads.completedSpec(ref)
                 if (cached != null) VodRepository.get(this).validateReference(ref, request)
-                val spec = cached ?: VodRepository.get(this).resolve(ref, request)
+                val prefetched = if (cached == null) VodSearchPreview.preparedSpec(ref) else null
+                if (prefetched != null) VodRepository.get(this).validateReference(ref, request)
+                val spec = cached ?: prefetched ?: VodRepository.get(this).resolve(ref, request)
                 request.check()
                 val uri = Uri.parse(spec.getString("url"))
                 require(uri.scheme in listOf("http", "https")) { "Only online HTTP media is supported" }
-                val http = downloads.playbackFactory(spec)
+                val network = downloads.playbackFactory(spec)
+                val http = if (prefetched != null) VodSearchPreview.playbackFactory(network) else network
                 main.post {
                     if (generation != playerGeneration) return@post
                     playerRequest = null
@@ -1112,7 +1208,7 @@ class VodLibraryActivity : Activity() {
                     val item = MediaItem.Builder().setUri(uri).setMediaId(spec.optString("id"))
                         .setMimeType(spec.optString("mimeType", "video/mp4")).build()
                     val source = DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http))
-                    val instance = ExoPlayer.Builder(this).setMediaSourceFactory(source).build()
+                    val instance = ExoPlayer.Builder(this, VodRenderers.create(this)).setMediaSourceFactory(source).build()
                     frameSource = source
                     player = instance; playerRef = ref; playerId = refId
                     android.util.Log.d("MaciPlay", "player created id=" + refId)
@@ -1123,7 +1219,12 @@ class VodLibraryActivity : Activity() {
                         override fun onPlaybackStateChanged(state: Int) {
                             android.util.Log.d("MaciPlay", "state=" + state + " ready=" + instance.playWhenReady +
                                 " playing=" + instance.isPlaying + " video=" + instance.videoSize + " error=" + instance.playerError)
-                            if (state == Player.STATE_READY) {
+                            if (player !== instance) return
+                            main.removeCallbacks(startupTimeout)
+                            if (state == Player.STATE_BUFFERING) {
+                                if (!renderedFrame) main.postDelayed(startupTimeout, 20_000)
+                                if (instance.playWhenReady) showDetailMessage("正在缓冲…")
+                            } else if (state == Player.STATE_READY) {
                                 showDetailMessage("")
                                 updatePlaybackControls()
                             }
@@ -1157,6 +1258,8 @@ class VodLibraryActivity : Activity() {
                         }
                         override fun onPlayerError(error: PlaybackException) {
                             android.util.Log.d("MaciPlay", "error " + error.errorCodeName + " " + error.message)
+                            if (player !== instance) return
+                            main.removeCallbacks(startupTimeout)
                             showChrome()
                             showDetailMessage("播放失败，请检查来源连接或切换线路")
                             hero.visibility = View.VISIBLE
@@ -1167,7 +1270,7 @@ class VodLibraryActivity : Activity() {
                     instance.prepare()
                     instance.playWhenReady = autoplay
                     android.util.Log.d("MaciPlay", "after playWhenReady=" + instance.playWhenReady + " auto=" + autoplay)
-                    if (!autoplay) { instance.pause(); showDetailMessage(""); showChrome() } else scheduleHideChrome()
+                    if (!autoplay) { instance.pause(); showChrome() } else scheduleHideChrome()
                     updatePlaybackControls()
                     preloadNextResource()
                 }
@@ -1183,20 +1286,12 @@ class VodLibraryActivity : Activity() {
 
     private fun prepareLatestProgress(value: LibraryDetail) {
         if (player != null || playerRequest != null || preparedKey == value.work.key) return
-        val prefs = getSharedPreferences("media-progress", MODE_PRIVATE)
-        var bestLine = -1; var bestEpisode: LibraryEpisode? = null; var bestAt = 0L
-        value.lines.forEachIndexed { lineIndex, line ->
-            line.episodes.forEach { episode ->
-                val ref = episode.reference
-                val id = MacCmsProvider.playbackId(ref.optString("sourceId"), ref.optString("vodId"),
-                    ref.optString("lineId"), ref.optString("episodeKey"))
-                val position = prefs.getLong(id, 0L)
-                val at = prefs.getLong("$id:updatedAt", 0L)
-                if (position > 0 && at > bestAt) { bestAt = at; bestLine = lineIndex; bestEpisode = episode }
-            }
-        }
-        val targetLine = if (bestLine >= 0) bestLine else value.lines.indexOfFirst { it.id == selectedLine }.coerceAtLeast(0)
-        val episode = bestEpisode ?: value.lines.getOrNull(targetLine)?.episodes?.firstOrNull() ?: return
+        val restored = if (value.work.key == restoredWorkKey) {
+            value.lines.firstOrNull { it.id == selectedLine }?.episodes
+                ?.firstOrNull { it.reference.optString("episodeKey") == selectedEpisode }
+        } else null
+        val episode = restored ?: value.preferredEpisode(this, selectedLine) ?: return
+        val targetLine = value.lines.indexOfFirst { it.id == episode.reference.optString("lineId") }
         preparedKey = value.work.key
         selectLine(targetLine, false)
         selectedEpisode = episode.reference.optString("episodeKey")
@@ -1210,7 +1305,7 @@ class VodLibraryActivity : Activity() {
             hero.visibility = View.VISIBLE
             showingFrame = true
         }
-        startEpisode(episode, false)
+        startEpisode(episode, restored != null && LibraryReference.key(ref) == resumeEpisodeKey)
     }
 
     private fun updatePlaybackControls() {
@@ -1306,7 +1401,10 @@ class VodLibraryActivity : Activity() {
                 val playing = playerRef
                 if (player != null && playing != null &&
                     LibraryReference.key(playing) == LibraryReference.key(episode.reference)) {
-                    togglePlayback()
+                    val current = player
+                    if (current?.playWhenReady == true && current.playbackState == Player.STATE_BUFFERING) {
+                        showDetailMessage("正在缓冲…")
+                    } else togglePlayback()
                 } else {
                     play(episode)
                 }
@@ -1409,7 +1507,9 @@ class VodLibraryActivity : Activity() {
         player?.let(::revealVideo)
         val key = selectedWorkKey; val previous = selectedWorkPosition
         val films = libraryModel.works(query, cachedOnly)
-        val pinned = spotlightWork?.takeIf { libraryModel.isCurrent(it.identity()) && films.none { film -> film.key == it.key } }
+        val pinned = spotlightWork?.takeIf {
+            (it.key == restoredWorkKey || libraryModel.isCurrent(it.identity())) && films.none { film -> film.key == it.key }
+        }
         posters.items = if (cachedOnly) films else listOfNotNull(pinned) + musicResults.map(::musicWork) + films
         if (posters.isEmpty) {
             if (!showingFrame) { hero.image.setImageDrawable(null); hero.bindTitle("") }
@@ -1510,7 +1610,7 @@ class VodLibraryActivity : Activity() {
 
     private fun renderDetail(focus: Boolean) {
         val value = detail ?: return
-        if (!showingFrame) hero.visibility = View.GONE
+        if (!showingFrame && spotlightWork?.key != value.work.key) hero.visibility = View.GONE
         if (cacheMode) {
             val available = value.lines.flatMap { it.episodes }.map { LibraryReference.key(it.reference) }.toSet()
             markedEpisodes.keys.retainAll(available)
@@ -1531,9 +1631,15 @@ class VodLibraryActivity : Activity() {
         if (value.lines.isEmpty()) { setEpisodeItems(emptyList()); renderActions() }
         else selectLine(index, focus)
         if (pendingAutoPlay || pendingUserPlay) {
+            val preferred = if (pendingAutoPlay && spotlightWork?.key == value.work.key) value.preferredEpisode(this) else null
             pendingAutoPlay = false; pendingUserPlay = false
-            (episodeAdapter.items.firstOrNull { it.reference.optString("episodeKey") == selectedEpisode }
-                ?: episodeAdapter.items.firstOrNull())?.let { startEpisode(it, true) }
+            if (preferred != null) {
+                selectLine(value.lines.indexOfFirst { it.id == preferred.reference.optString("lineId") }, false)
+                play(preferred)
+            } else {
+                (episodeAdapter.items.firstOrNull { it.reference.optString("episodeKey") == selectedEpisode }
+                    ?: episodeAdapter.items.firstOrNull())?.let { startEpisode(it, true) }
+            }
         } else if (!detailLoading && player == null) prepareLatestProgress(value)
         updatePlaybackControls()
     }
@@ -1549,7 +1655,6 @@ class VodLibraryActivity : Activity() {
         work?.let { lineCache[it.key] = line.id }
         if (selectedEpisode.isNotEmpty()) work?.let { episodeCache[it.key] = selectedEpisode }
         detail?.let { detailCache.put(it.work.key, it) }
-        saveSessionSnapshot()
         if (focus && dialog?.isShowing != true) chrome.resetFocus()
     }
 
@@ -1685,11 +1790,11 @@ class VodLibraryActivity : Activity() {
         val selected = episodeAdapter.items.indexOfFirst {
             it.reference.optString("episodeKey") == selectedEpisode
         }.coerceAtLeast(0)
-        chrome.render(playerTitle, "", items, selected, themeColor = resourceTheme ?: PlaybackThemeColor.FALLBACK)
+        chrome.render(playerTitle, "", items, selected, status = detailStatus, themeColor = resourceTheme ?: PlaybackThemeColor.FALLBACK)
         val current = player
         val duration = current?.duration?.takeIf { it > 0 }
         if (duration != null) {
-            chrome.setTitleProgress(current.currentPosition, duration, resourceTheme)
+            chrome.setTitleProgress(remoteSeek.previewPosition(current) ?: current.currentPosition, duration, resourceTheme)
         } else {
             val reference = episodeAdapter.items.getOrNull(selected)?.reference
             val id = reference?.let {
@@ -1711,7 +1816,6 @@ class VodLibraryActivity : Activity() {
         }
         selectedEpisode = episode.reference.optString("episodeKey")
         work?.let { episodeCache[it.key] = selectedEpisode }
-        saveSessionSnapshot()
         startEpisode(episode, true)
     }
 
@@ -1781,9 +1885,18 @@ class VodLibraryActivity : Activity() {
     }
 
     private fun applyCacheStatus(status: JSONObject) {
+        val previousFailures = libraryModel.caches.filter { it.state == "failed" }
+            .associate { LibraryReference.key(it.reference) to it.error }
         val before = libraryModel.caches.map { listOf(LibraryReference.key(it.reference), it.state, it.percent, it.bytes, it.error) }
         libraryModel.updateCaches(status)
         val after = libraryModel.caches.map { listOf(LibraryReference.key(it.reference), it.state, it.percent, it.bytes, it.error) }
+        libraryModel.caches.firstOrNull {
+            it.state == "failed" && it.error.isNotBlank() && previousFailures[LibraryReference.key(it.reference)] != it.error
+        }?.let { failed ->
+            val episode = listOf(failed.title, failed.label).filter { it.isNotBlank() }.joinToString(" · ")
+            val notice = if (episode.isEmpty()) failed.error else "$episode：${failed.error}"
+            Toast.makeText(this, notice, Toast.LENGTH_LONG).show()
+        }
         val currentWork = work
         val workStatus = currentWork?.caches?.map { listOf(LibraryReference.key(it.reference), it.state, it.percent, it.bytes, it.error) }
         val latestWorkStatus = libraryModel.caches.filter { it.workKey == currentWork?.key }
@@ -1838,6 +1951,7 @@ class VodLibraryActivity : Activity() {
     private fun showDetailMessage(value: String) {
         if (detailStatus == value) return
         detailStatus = value
+        if (::chrome.isInitialized) chrome.setStatus(value)
         if (value.isNotBlank() && ::root.isInitialized) root.announceForAccessibility(value)
     }
 

@@ -10,7 +10,7 @@ import org.json.JSONObject
 /** Online manifests and segments use routing rules without opening a disk media cache. */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 internal object VodMediaHttp {
-    fun factory(context: Context, spec: JSONObject): DataSource.Factory {
+    fun factory(context: Context, spec: JSONObject, previewRequest: VodRequest? = null): DataSource.Factory {
         val origin = spec.getString("url").toHttpUrl()
         require(origin.username.isEmpty() && origin.password.isEmpty()) { "Credentials must be request headers" }
         val headers = linkedMapOf<String, String>()
@@ -23,6 +23,14 @@ internal object VodMediaHttp {
             val builder = request.newBuilder()
             if (!sameOrigin) headers.keys.filterNot { portable(it) }.forEach { builder.removeHeader(it) }
             chain.proceed(builder.build())
+        }.apply {
+            if (previewRequest != null) eventListener(object : okhttp3.EventListener() {
+                override fun callStart(call: okhttp3.Call) {
+                    try { previewRequest.attach(call) } catch (_: VodException) { call.cancel() }
+                }
+                override fun callEnd(call: okhttp3.Call) { previewRequest.detach(call) }
+                override fun callFailed(call: okhttp3.Call, ioe: java.io.IOException) { previewRequest.detach(call) }
+            })
         }.build()
         return OkHttpDataSource.Factory(MediaNetwork.get(context).client(network)).setDefaultRequestProperties(headers)
     }

@@ -80,6 +80,8 @@ internal class LibraryPosterView(context: Context) : FrameLayout(context) {
             intArrayOf(Color.rgb(43, 49, 62), Color.rgb(17, 21, 30)))
         addView(placeholder, LayoutParams(-1, -1)); addView(image, LayoutParams(-1, -1))
     }
+    fun hideTitle() { placeholder.visibility = View.GONE }
+
     fun bindTitle(title: String) { placeholder.text = title.ifBlank { "未命名影片" } }
 }
 

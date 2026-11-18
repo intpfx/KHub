@@ -4,8 +4,10 @@ import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.ColorStateList
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.GradientDrawable
 import android.text.Editable
 import android.text.TextWatcher
@@ -21,10 +23,16 @@ import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.live.tv.media.LibraryReference
+import com.live.tv.media.LibraryWork
+import com.live.tv.media.PosterMatch
 import com.live.tv.media.RecentVodHistory
+import com.live.tv.media.VodCacheManager
 import com.live.tv.media.VodLibraryActivity
 import com.live.tv.media.VodRepository
 import com.live.tv.media.VodRequest
+import com.live.tv.media.VodSourcePriority
+import com.live.tv.media.VodSearchPreview
 import com.live.tv.music.MusicActivity
 import com.live.tv.music.catalog.MusicRepository
 import com.live.tv.music.catalog.musicSearchFailureMessage
@@ -76,6 +84,8 @@ class GlobalSearchOverlay(
     private var toolbarFocus: View? = null
     private val panel = LinearLayout(context)
     private val images by lazy { LibraryPosterImages(context) }
+    private val videoPreview by lazy { VodSearchPreview(context, scope) }
+    private var previewRow: View? = null
     private var searchJob: Job? = null
     private var queryRevision = 0
     private var previousFocus: java.lang.ref.WeakReference<View>? = null
@@ -335,6 +345,7 @@ class GlobalSearchOverlay(
     private fun dismiss(after: () -> Unit = {}) {
         if (!open || closing) return
         closing = true
+        stopVideoPreview()
         stopEditing()
         searchJob?.cancel()
         queryRevision++
@@ -351,7 +362,13 @@ class GlobalSearchOverlay(
         }
     }
 
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        if (!hasWindowFocus) stopVideoPreview()
+    }
+
     override fun onDetachedFromWindow() {
+        stopVideoPreview()
         panelAnimator?.cancel()
         panelAnimator = null
         visiblePanelHeight = 0
@@ -386,7 +403,14 @@ class GlobalSearchOverlay(
         }
     }
 
+    private fun stopVideoPreview() {
+        if (previewRow == null) return
+        previewRow = null
+        videoPreview.stop()
+    }
+
     private fun queueSearch(query: String) {
+        stopVideoPreview()
         searchJob?.cancel()
         images.cancel()
         val revision = ++queryRevision
@@ -400,13 +424,36 @@ class GlobalSearchOverlay(
         if (text.isEmpty()) {
             setStatus("")
             if (currentPage == Page.VOD) {
-                RecentVodHistory(context).entries().forEach { row ->
-                    addResult(row.optString("title"),
-                        listOf(row.optString("episodeLabel"), row.optString("sourceName"))
-                            .filter { it.isNotBlank() }.joinToString(" · "),
-                        Page.VOD.icon,
+                val recentRows = RecentVodHistory(context).entries().map { row ->
+                    val metadata = listOf(row.optString("episodeLabel"), row.optString("sourceName"))
+                        .filter { it.isNotBlank() }.joinToString(" · ")
+                    val (_, detail) = addResult(row.optString("title"), metadata, Page.VOD.icon,
                         Intent(context, VodLibraryActivity::class.java).putExtra("recent_vod", row.toString()),
-                        row.optString("poster"))
+                        row.optString("poster"),
+                        previewWork = LibraryWork(row.getString("sourceId"), row.getString("vodId"),
+                            row.getInt("revision"), row.getInt("epoch"), row.optString("title")),
+                        previewEpisode = LibraryReference.read(row))
+                    Triple(row, metadata, detail)
+                }
+                if (recentRows.isNotEmpty()) searchJob = scope.launch {
+                    val cachedByWork = attemptSearch {
+                        withContext(Dispatchers.IO) {
+                            val caches = VodCacheManager.get(context).status().getJSONArray("caches")
+                            (0 until caches.length()).mapNotNull { index ->
+                                val entry = caches.getJSONObject(index)
+                                if (entry.optString("state") == "complete")
+                                    LibraryReference.read(entry.optJSONObject("ref")) else null
+                            }.groupBy(LibraryReference::workKey)
+                        }
+                    } ?: return@launch
+                    if (!isOpen() || revision != queryRevision) return@launch
+                    for ((row, metadata, detail) in recentRows) {
+                        val episodes = cachedByWork[LibraryReference.workKey(row)] ?: continue
+                        val latestCached = episodes.any { LibraryReference.key(it) == LibraryReference.key(row) }
+                        val cacheLabel = "已缓存 ${episodes.size} 集" + if (latestCached) " · 本集已缓存" else ""
+                        detail.text = listOf(cacheLabel, metadata).filter { it.isNotBlank() }.joinToString(" · ")
+                        detail.visibility = VISIBLE
+                    }
                 }
             }
             val hasHistory = results.childCount > 0
@@ -420,28 +467,34 @@ class GlobalSearchOverlay(
             delay(250)
             when (currentPage) {
                 Page.VOD -> {
-                    val movies = attemptSearch {
-                        val request = VodRequest()
+                    val request = VodRequest()
+                    val response = attemptSearch {
                         try {
                             runInterruptible(Dispatchers.IO) {
-                                val response = VodRepository.get(context).search(text, 1, request)
-                                check(response.optBoolean("ok"))
-                                val items = response.getJSONObject("search").getJSONArray("items")
-                                (0 until minOf(items.length(), 12)).map { items.getJSONObject(it) }
+                                VodRepository.get(context).search(text, 1, request) { films ->
+                                    val batch = films.take(12)
+                                    post {
+                                        if (!isOpen() || closing || revision != queryRevision) return@post
+                                        batch.forEach { addFilmResult(it) }
+                                    }
+                                }
                             }
                         } finally {
                             request.cancel()
                         }
                     }
                     if (!isOpen() || revision != queryRevision) return@launch
-                    movies.orEmpty().forEach { film ->
-                        val metadata = listOf("year", "remarks", "sourceName").map { film.optString(it) }
-                            .filter { it.isNotBlank() }.joinToString(" · ")
-                        addResult(film.optString("title"), metadata, currentPage.icon,
-                            Intent(context, VodLibraryActivity::class.java).putExtra("selected_vod", film.toString()),
-                            film.optString("poster"))
-                    }
-                    setStatus(if (movies == null) "影视搜索暂不可用" else if (movies.isEmpty()) "未找到影视" else "")
+                    val search = response?.optJSONObject("search")
+                    val sources = search?.optJSONArray("sources") ?: JSONArray()
+                    val failures = (0 until sources.length()).map(sources::getJSONObject)
+                        .filter { it.optString("status") == "error" }.map { it.optString("sourceName") }
+                    val hasItems = (search?.optJSONArray("items")?.length() ?: 0) > 0
+                    setStatus(when {
+                        response?.optBoolean("ok") != true -> "影视搜索暂不可用"
+                        failures.isNotEmpty() -> "暂不可用：${failures.joinToString("、")}"
+                        !hasItems -> "未找到影视"
+                        else -> ""
+                    })
                 }
                 Page.MUSIC -> {
                     val repository = MusicRepository.get(context)
@@ -460,7 +513,7 @@ class GlobalSearchOverlay(
                             put("artists", JSONArray(track.artists))
                             put("album", track.album); put("pictureId", track.pictureId); put("lyricId", track.lyricId)
                         }
-                        val image = addResult(track.name, track.artists.joinToString(" / "), currentPage.icon,
+                        val (image) = addResult(track.name, track.artists.joinToString(" / "), currentPage.icon,
                             Intent(context, MusicActivity::class.java).putExtra("selected_track", selected.toString()))
                         if (index < 4) launch artworkLoad@{
                             val cached = withContext(Dispatchers.IO) {
@@ -481,6 +534,54 @@ class GlobalSearchOverlay(
         }
     }
 
+    private fun addFilmResult(film: JSONObject) {
+        val metadata = listOf("sourceName", "year", "remarks").map { film.optString(it) }
+            .filter { it.isNotBlank() }.joinToString(" · ")
+        val title = film.optString("title")
+        val work = LibraryWork(
+            sourceId = film.optString("sourceId"),
+            vodId = film.optString("vodId"),
+            revision = film.optInt("revision"),
+            epoch = film.optInt("epoch"),
+            title = title,
+            poster = film.optString("poster"),
+            year = film.optString("year"),
+            type = film.optString("typeName"),
+        )
+        val placement = FilmPlacement(work, VodSourcePriority.rank(film.optString("sourceName")))
+        var insertion = results.childCount
+        for (index in 0 until results.childCount) {
+            val existing = results.getChildAt(index).tag as? FilmPlacement ?: continue
+            if (existing.titleKey != placement.titleKey) continue
+            if (existing.rank > placement.rank) {
+                insertion = index
+                break
+            }
+            insertion = index + 1
+        }
+        val (poster) = addResult(title, metadata, Page.VOD.icon,
+            Intent(context, VodLibraryActivity::class.java).putExtra("selected_vod", film.toString()),
+            placement = placement, insertion = insertion)
+        poster.onPosterLoaded = { bitmap -> shareFilmPoster(placement, poster, bitmap) }
+        for (index in 0 until results.childCount) {
+            val row = results.getChildAt(index) as LinearLayout
+            val peer = row.tag as? FilmPlacement ?: continue
+            val bitmap = ((row.getChildAt(0) as ImageView).drawable as? BitmapDrawable)?.bitmap ?: continue
+            if (placement.matches(peer) && poster.showSharedPoster(bitmap)) break
+        }
+        images.loadKeepingPlaceholder(poster, work)
+    }
+
+    private fun shareFilmPoster(placement: FilmPlacement, poster: ResultImage, bitmap: Bitmap) {
+        for (index in 0 until results.childCount) {
+            val row = results.getChildAt(index) as LinearLayout
+            val peer = row.tag as? FilmPlacement ?: continue
+            val image = row.getChildAt(0) as ResultImage
+            if (image !== poster && placement.matches(peer) && image.drawable !is BitmapDrawable)
+                image.showSharedPoster(bitmap)
+        }
+    }
+
     private fun setStatus(value: String) {
         status.text = value
         status.visibility = if (value.isEmpty()) GONE else VISIBLE
@@ -494,8 +595,37 @@ class GlobalSearchOverlay(
         null
     }
 
-    private fun addResult(title: String, subtitle: String, iconRes: Int, intent: Intent, artwork: String = ""): ImageView {
-        val icon = ImageView(context).apply {
+    private data class FilmPlacement(val work: LibraryWork, val rank: Int) {
+        val titleKey = VodSourcePriority.titleKey(work.title)
+        private val year = PosterMatch.year(work.year)
+        private val kind = PosterMatch.kind(work.type)
+
+        fun matches(other: FilmPlacement): Boolean =
+            work.sourceId != other.work.sourceId && titleKey.isNotBlank() && titleKey == other.titleKey &&
+                year != null && year == other.year && kind != null && kind == other.kind
+    }
+
+    private class ResultImage(context: Context) : androidx.appcompat.widget.AppCompatImageView(context) {
+        var onPosterLoaded: ((Bitmap) -> Unit)? = null
+
+        override fun setImageBitmap(bitmap: Bitmap?) {
+            if (bitmap != null && onPosterLoaded != null) scaleType = ScaleType.CENTER_CROP
+            super.setImageBitmap(bitmap)
+            bitmap?.let { onPosterLoaded?.invoke(it) }
+        }
+
+        fun showSharedPoster(bitmap: Bitmap): Boolean {
+            if (bitmap.width < 80 || bitmap.height < 100 || bitmap.width.toFloat() / bitmap.height !in .3f..2f) return false
+            scaleType = ScaleType.CENTER_CROP
+            setImageDrawable(BitmapDrawable(resources, bitmap))
+            return true
+        }
+    }
+
+    private fun addResult(title: String, subtitle: String, iconRes: Int, intent: Intent, artwork: String = "",
+        placement: FilmPlacement? = null, insertion: Int = -1,
+        previewWork: LibraryWork? = placement?.work, previewEpisode: JSONObject? = null): Pair<ResultImage, TextView> {
+        val icon = ResultImage(context).apply {
             background = glass(dp(9).toFloat(), 0xff333943.toInt(), 0x22ffffff)
             clipToOutline = true
             setImageResource(iconRes)
@@ -516,6 +646,7 @@ class GlobalSearchOverlay(
             visibility = if (subtitle.isBlank()) GONE else VISIBLE
         }
         val row = LinearLayout(context).apply {
+            tag = placement
             gravity = Gravity.CENTER_VERTICAL
             isFocusableInTouchMode = true
             isClickable = true
@@ -528,6 +659,9 @@ class GlobalSearchOverlay(
                 addView(detail)
             }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(14) })
             setOnClickListener {
+                if (previewWork != null) {
+                    (icon.drawable as? BitmapDrawable)?.bitmap?.let { VodSearchPreview.rememberPoster(previewWork.key, it) }
+                }
                 dismiss {
                     context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
                 }
@@ -552,14 +686,20 @@ class GlobalSearchOverlay(
             name.setTextColor(if (focused) 0xff171b22.toInt() else Color.WHITE)
             detail.setTextColor(if (focused) 0xff454a55.toInt() else 0xffc0c4cc.toInt())
         }
-        row.setOnFocusChangeListener { _, focused -> paint(focused) }
+        row.setOnFocusChangeListener { _, focused ->
+            paint(focused)
+            if (focused && previewWork != null && isOpen() && !closing) {
+                previewRow = row
+                videoPreview.focus(previewWork, previewEpisode)
+            } else if (!focused && previewRow === row) stopVideoPreview()
+        }
         paint(false)
-        results.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
+        results.addView(row, insertion, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
         if (artwork.isNotBlank()) {
             icon.scaleType = ImageView.ScaleType.CENTER_CROP
             images.load(icon, artwork)
         }
-        return icon
+        return icon to detail
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

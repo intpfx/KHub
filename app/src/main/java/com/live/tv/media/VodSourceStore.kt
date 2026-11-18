@@ -9,6 +9,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
+internal data class ImportedVodEpisode(val label: String, val url: HttpUrl)
+
 internal data class VodSource(
     val id: String,
     val name: String,
@@ -18,15 +20,23 @@ internal data class VodSource(
     val playUrl: String = "",
     val searchable: Boolean = true,
     val revision: Int = 1,
-    val epoch: Int = 1
+    val epoch: Int = 1,
+    val importedEpisodes: List<ImportedVodEpisode> = emptyList()
 ) {
     fun publicJson(): JSONObject = JSONObject().put("id", id).put("name", name).put("apiType", 1)
         .put("revision", revision).put("epoch", epoch).put("searchable", searchable)
         .put("requiresParser", playUrl.isNotEmpty())
-        .put("url", api.newBuilder().query(null).fragment(null).build().toString())
+        .apply {
+            if (importedEpisodes.isEmpty()) put("url", api.newBuilder().query(null).fragment(null).build().toString())
+            else put("importedEpisodeCount", importedEpisodes.size)
+        }
 
     fun configJson(): JSONObject = JSONObject().put("url", api.toString()).put("header", JSONObject(headers))
-        .put("ext", ext).put("playUrl", playUrl)
+        .put("ext", ext).put("playUrl", playUrl).apply {
+            if (importedEpisodes.isNotEmpty()) put("importedEpisodes", JSONArray(importedEpisodes.map {
+                JSONObject().put("label", it.label).put("url", it.url.toString())
+            }))
+        }
 }
 
 /** Config (including signed API URLs and headers) is encrypted before AtomicFile persistence. */
@@ -68,7 +78,13 @@ internal class VodSourceStore(
                     val config = JSONObject(open(row.getString("configSealed")))
                     VodSource(row.getString("id"), row.getString("name"), httpUrl(config.getString("url")),
                         headers(config.optJSONObject("header") ?: JSONObject()), config.optString("ext"),
-                        config.optString("playUrl"), row.optBoolean("searchable", true), row.getInt("revision"), row.getInt("epoch"))
+                        config.optString("playUrl"), row.optBoolean("searchable", true), row.getInt("revision"), row.getInt("epoch"),
+                        config.optJSONArray("importedEpisodes")?.let { episodes ->
+                            (0 until episodes.length()).map { index ->
+                                val episode = episodes.getJSONObject(index)
+                                importedEpisode(episode.getString("label"), episode.getString("url"))
+                            }.also { require(it.size in 1..MAX_IMPORTED_EPISODES) }
+                        }.orEmpty())
                 }
                 require(sources.map { it.id }.distinct().size == sources.size)
                 require(sources.all { it.id.isNotBlank() && it.revision > 0 && it.epoch > 0 })
@@ -76,7 +92,7 @@ internal class VodSourceStore(
         }
     }
 
-    @Synchronized fun state(): JSONObject = JSONObject().put("sources", JSONArray(sources.map { it.publicJson() }))
+    @Synchronized fun state(): JSONObject = JSONObject().put("sources", JSONArray(sources.sortedBy { VodSourcePriority.rank(it.name) }.map { it.publicJson() }))
         .put("errorCode", if (loadFailed) "SOURCE_STORE" else "")
 
     @Synchronized fun source(id: String): VodSource {
@@ -88,6 +104,10 @@ internal class VodSourceStore(
         if (loadFailed) throw VodException("SOURCE_STORE", "点播来源读取失败，未覆盖原文件")
         val values = when (form["preset"]) {
             null -> form
+            "xigua" -> {
+                sources.firstOrNull { it.api.toString().trimEnd('/') == XIGUA_API.trimEnd('/') }?.let { return it }
+                mapOf("name" to "西瓜资源站", "url" to XIGUA_API)
+            }
             "wsyzy" -> {
                 // Retry after a lost response, or another LAN client's click, must not add a duplicate.
                 sources.firstOrNull(WsyzyProvider::supports)?.let { return it }
@@ -113,6 +133,28 @@ internal class VodSourceStore(
         return source
     }
 
+    @Synchronized fun importM3u8(title: String, input: String): VodSource {
+        if (loadFailed) throw VodException("SOURCE_STORE", "点播来源读取失败，未覆盖原文件")
+        val name = title.trim()
+        if (name.isEmpty() || name.length > 120 || name.any(Char::isISOControl))
+            throw VodException("INVALID_SOURCE", "请填写 1–120 字的影视名称")
+        if (input.length > 512 * 1024) throw VodException("INVALID_SOURCE", "选集列表过大")
+        val rows = input.lineSequence().map(String::trim).filter(String::isNotBlank).take(MAX_IMPORTED_EPISODES + 1).toList()
+        if (rows.size !in 1..MAX_IMPORTED_EPISODES)
+            throw VodException("INVALID_SOURCE", "请填写 1–${MAX_IMPORTED_EPISODES} 条 M3U8 地址")
+        val episodes = rows.mapIndexed { index, row ->
+            val fields = row.split('	', '|', limit = 2)
+            val (label, url) = if (row.startsWith("https://", true) || row.startsWith("http://", true) || fields.size == 1)
+                ("第 ${index + 1} 集" to row) else fields[0].trim() to fields[1].trim()
+            importedEpisode(label, url)
+        }
+        sources.firstOrNull { it.name == name && it.importedEpisodes == episodes }?.let { return it }
+        if (sources.size >= 32) throw VodException("SOURCE_LIMIT", "最多添加 32 个点播来源")
+        val source = VodSource(UUID.randomUUID().toString(), name, episodes.first().url, importedEpisodes = episodes)
+        save(sources + source)
+        return source
+    }
+
     @Synchronized fun remove(id: String) {
         source(id)
         save(sources.filterNot { it.id == id })
@@ -121,6 +163,7 @@ internal class VodSourceStore(
     /** Changing the API keeps source/episode identity; outstanding selections must be reloaded. */
     @Synchronized fun updateEndpoint(form: Map<String, String>): VodSource {
         val previous = source(form["id"].orEmpty())
+        if (previous.importedEpisodes.isNotEmpty()) throw VodException("INVALID_SOURCE", "导入的选集没有采集接口")
         val api = httpUrl(form["url"].orEmpty())
         if (previous.api == api) return previous
         if (previous.revision == Int.MAX_VALUE) throw VodException("SOURCE_STORE", "来源版本已达上限")
@@ -148,6 +191,19 @@ internal class VodSourceStore(
     }
 
     companion object {
+        private const val XIGUA_API = "https://xgzy8.tv/api.php/provide/vod/from/xiguam3u8/at/json/"
+        private const val MAX_IMPORTED_EPISODES = 300
+
+        private fun importedEpisode(label: String, value: String): ImportedVodEpisode {
+            if (label.isBlank() || label.length > 160 || label.any(Char::isISOControl))
+                throw VodException("INVALID_SOURCE", "选集名称须为 1–160 字")
+            val url = httpUrl(value)
+            if (!url.encodedPath.endsWith(".m3u8", ignoreCase = true))
+                throw VodException("INVALID_SOURCE", "每行须包含一个 HTTP 或 HTTPS M3U8 地址")
+            return ImportedVodEpisode(label, url)
+        }
+
+
         internal fun httpUrl(value: String): HttpUrl {
             val url = value.takeIf { it.length <= 8192 }?.toHttpUrlOrNull()
                 ?: throw VodException("INVALID_SOURCE", "来源地址须为 HTTP 或 HTTPS")

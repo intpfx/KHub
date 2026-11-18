@@ -68,6 +68,49 @@ class GlobalSearchOverlayTest {
         assertEquals("ep2", item.getString("episodeKey"))
     }
 
+    @Test fun clearingHistoryRemovesRecentRowsAndKeepsPlaybackProgress() {
+        val activity = Robolectric.buildActivity(VodLibraryActivity::class.java).get()
+        val history = RecentVodHistory(activity)
+        val work = LibraryWork("source", "work", 1, 1, "电影")
+        val progress = activity.getSharedPreferences("media-progress", 0)
+        progress.edit().putLong("sample", 1234L).apply()
+        history.record(work, work.reference("line", "episode"), "第 1 集")
+        history.clear()
+
+        val overlay = GlobalSearchOverlay(activity)
+        overlay.show()
+        assertEquals(0, overlay.findViewWithTag<ViewGroup>("global-search-results").childCount)
+        assertEquals(1234L, progress.getLong("sample", 0L))
+        history.record(work, work.reference("line", "episode"), "第 1 集")
+        assertEquals(1, history.entries().size)
+    }
+
+    @Test fun streamingSameFilmSharesDecodedPosterWithoutWaitingForTheBrokenImage() {
+        val activity = Robolectric.buildActivity(VodLibraryActivity::class.java).get()
+        val overlay = GlobalSearchOverlay(activity)
+        overlay.show()
+        val addFilm = overlay.javaClass.getDeclaredMethod("addFilmResult", JSONObject::class.java).apply { isAccessible = true }
+        val results = overlay.findViewWithTag<ViewGroup>("global-search-results")
+        fun add(source: String, year: String) {
+            addFilm.invoke(overlay, JSONObject().put("title", "现在就出发第四季")
+                .put("sourceId", source).put("sourceName", source).put("vodId", "test")
+                .put("revision", 1).put("epoch", 1).put("year", year).put("typeName", "大陆综艺"))
+        }
+        fun poster(index: Int) = (results.getChildAt(index) as ViewGroup).getChildAt(0) as android.widget.ImageView
+        fun bitmap(index: Int) = (poster(index).drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+
+        add("西瓜资源站", "2026")
+        add("360资源", "2026")
+        add("重制版", "2025")
+        val artwork = android.graphics.Bitmap.createBitmap(120, 180, android.graphics.Bitmap.Config.ARGB_8888)
+        poster(1).setImageBitmap(artwork)
+        assertSame(artwork, bitmap(0))
+        assertNull(bitmap(2))
+        add("魔都资源", "2026")
+        assertSame(artwork, bitmap(2))
+        assertNull(bitmap(3))
+    }
+
     @Test fun panelAnimatesBelowStationaryToolbarWithoutMovingFocus() {
         val host = Robolectric.buildActivity(Activity::class.java).setup().get()
         val vod = Robolectric.buildActivity(VodLibraryActivity::class.java).get()

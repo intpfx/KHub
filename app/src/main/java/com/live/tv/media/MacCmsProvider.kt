@@ -32,10 +32,20 @@ internal class MacCmsProvider(private val source: VodSource, client: OkHttpClien
         if (page !in 1..10_000 || categoryId.length > 256 || query.length > 200)
             throw VodException("INVALID_QUERY", "查询参数无效")
         if (query.isNotEmpty() && !source.searchable) throw VodException("SEARCH_DISABLED", "此来源已关闭搜索")
+        if (source.importedEpisodes.isNotEmpty()) {
+            request.check()
+            val items = JSONArray()
+            if (page == 1 && categoryId.isEmpty() && source.name.contains(query, ignoreCase = true))
+                items.put(importedSummary())
+            return JSONObject().put("sourceId", source.id).put("revision", source.revision).put("epoch", source.epoch)
+                .put("categories", JSONArray()).put("items", items).put("page", page).put("reportedPage", page)
+                .put("pageCount", 1).put("hasMore", false)
+        }
         val parameters = linkedMapOf<String, String>()
         val operation = when {
             query.isNotEmpty() -> {
-                parameters["wd"] = query
+                // This catalog matches CJK titles with the original punctuation but without inter-word spaces.
+                parameters["wd"] = if (source.api.host == "xgzy8.tv") CJK_TITLE_SPACES.replace(query, "") else query
                 parameters["quick"] = "false"
                 parameters["extend"] = source.ext
                 if (page > 1) parameters["pg"] = page.toString()
@@ -91,6 +101,14 @@ internal class MacCmsProvider(private val source: VodSource, client: OkHttpClien
 
     override fun detail(vodId: String, request: VodRequest): VodParsedDetail {
         if (vodId.isBlank() || vodId.length > 256) throw VodException("INVALID_SELECTION", "作品引用无效")
+        if (source.importedEpisodes.isNotEmpty()) {
+            request.check()
+            if (vodId != "imported") throw VodException("DETAIL_NOT_FOUND", "未找到导入的作品")
+            val episodes = source.importedEpisodes.mapIndexed { index, episode ->
+                VodEpisode((index + 1).toString(), episode.label, true, episode.url.toString())
+            }
+            return VodParsedDetail(importedSummary(), listOf(VodLine("m3u8", "M3U8", true, episodes)))
+        }
         val root = fetch("detail", linkedMapOf("ac" to "detail", "ids" to vodId), 4 * 1024 * 1024, request)
         val rows = list(root)
         if (rows.length() > 200) throw VodException("PAYLOAD_LIMIT", "详情作品过多")
@@ -254,6 +272,9 @@ internal class MacCmsProvider(private val source: VodSource, client: OkHttpClien
         return url?.takeIf { it.username.isEmpty() && it.password.isEmpty() && it.fragment == null }
     }
 
+    private fun importedSummary() = summary(JSONObject().put("vod_name", source.name), "imported")
+        .put("revision", source.revision).put("epoch", source.epoch).put("requiresParser", false)
+
     private fun summary(row: JSONObject, id: String): JSONObject {
         return JSONObject().put("id", workId(source.id, id)).put("sourceId", source.id).put("vodId", id)
             .put("title", plain(scalar(row, "vod_name"), 512).ifBlank { "未命名影片" })
@@ -327,6 +348,7 @@ internal class MacCmsProvider(private val source: VodSource, client: OkHttpClien
     }
 
     companion object {
+        private val CJK_TITLE_SPACES = Regex("""(?<=[㐀-鿿])[\s\p{Zs}]+(?=[㐀-鿿])""")
         internal fun workId(sourceId: String, vodId: String) = "vod:" + digest(sourceId, vodId)
         internal fun playbackId(sourceId: String, vodId: String, lineId: String, episodeKey: String) = "vod:" + digest(sourceId, vodId, lineId, episodeKey)
         private fun digest(vararg parts: String): String = MessageDigest.getInstance("SHA-256")
@@ -446,6 +468,10 @@ internal class VodHttp(client: OkHttpClient) {
             catch (_: java.io.InterruptedIOException) {
                 request.check()
                 throw VodException("NETWORK_TIMEOUT", "来源请求超时")
+            }
+            catch (_: java.net.SocketException) {
+                request.check()
+                throw VodException("NETWORK_DISCONNECTED", "来源网络连接中断")
             }
             catch (_: Exception) {
                 request.check()

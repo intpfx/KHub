@@ -16,6 +16,8 @@ internal class RecentVodHistory(context: Context) {
         }
     }
 
+    fun clear() { prefs.edit().remove("entries").apply() }
+
     fun record(work: LibraryWork, reference: JSONObject, episodeLabel: String) {
         val row = LibraryReference.read(reference) ?: return
         if (LibraryReference.workKey(row) != work.key) return

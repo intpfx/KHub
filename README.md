@@ -96,7 +96,9 @@ MiTV-MFTR0（Android 14，versionCode 73），设备读回的 APK 与本地构�
 TVBox 配置、Spider / JAR 与通用网页解析不属于当前 JSON
 点播支持范围。系统字体由设备决定；海报抠字、艺术字体及本地模型实验不属于正式播放器功能。
 
-影视来源设置提供“添加无损云”快捷入口，也会自动识别已配置的
+影视来源设置提供“添加西瓜资源”快捷入口，使用
+`https://xgzy8.tv/api.php/provide/vod/from/xiguam3u8/at/json/`。
+手动配置无损云时，应用仍会识别
 `https://api.wsyzy.net/api.php/provide/vod/`。其搜索使用独立联想接口，单次最多显示
 50
 条；结果受限时会提示使用更具体的片名，不重复请求无效的下一页。目录浏览、详情选集、原生
